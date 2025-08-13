@@ -59,6 +59,32 @@ print(response.json())</code></pre>
     </div>
 
     <div class="endpoint">
+        <h3>Export All Tags (Address Space)</h3>
+        <p><span class="method">GET</span> <code>/api/v1/export/tags?format=json|csv</code></p>
+        <p>Exports all Variable nodes in the entire address space. Requires active OPC UA connection.</p>
+        <strong>Example (curl, JSON):</strong>
+        <pre><code>curl -s "http://localhost:8080/api/v1/export/tags?format=json" | jq .</code></pre>
+        <strong>Example (curl, CSV download):</strong>
+        <pre><code>curl -L "http://localhost:8080/api/v1/export/tags?format=csv" -o tags_all.csv</code></pre>
+    </div>
+
+    <div class="endpoint">
+        <h3>Export Folder Tags</h3>
+        <p><span class="method">GET</span> <code>/api/v1/export/tags/folder?node_id=&lt;NodeID&gt;&amp;recursive=true|false&amp;format=json|csv</code></p>
+        <p>Exports all Variable nodes under a given folder node. Set <code>recursive</code> to control depth. Requires active OPC UA connection.</p>
+        <strong>Example (curl):</strong>
+        <pre><code>curl -s "http://localhost:8080/api/v1/export/tags/folder?node_id=ns=2;i=7&amp;recursive=true&amp;format=json" | jq .</code></pre>
+        <strong>Response (JSON item example):</strong>
+        <pre><code>{
+  "node_id": "ns=2;s=MyTag1",
+  "name": "MyTag1",
+  "data_type": "Int32",
+  "description": "",
+  "path": ""
+}</code></pre>
+    </div>
+
+    <div class="endpoint">
         <h3>Write Node Value</h3>
         <p><span class="method">POST</span> <code>/api/v1/write</code></p>
         <p>Writes a value to a single OPC UA node.</p>
@@ -95,11 +121,22 @@ print(response.json())</code></pre>
     "action": "subscribe",
     "node_ids": ["ns=2;s=MyTag1", "ns=2;s=AnotherTag"]
 }</code></pre>
+        <p>On subscribe, the server will:</p>
+        <ul>
+            <li>Create server-side watches for those node IDs (if not already).</li>
+            <li>Immediately send one snapshot for each node to this client.</li>
+            <li>After that, push real-time updates on value change.</li>
+        </ul>
         <strong>Unsubscribe Message (JSON):</strong>
         <pre><code>{
     "action": "unsubscribe",
     "node_ids": ["ns=2;s=MyTag1"]
 }</code></pre>
+        <strong>Subscribe All (JSON):</strong>
+        <pre><code>{
+    "action": "subscribe_all"
+}</code></pre>
+        <p><em>Note:</em> <code>subscribe_all</code> forwards updates for all server-side watched nodes. To receive updates, either subscribe specific nodes via <code>subscribe</code>, or ensure watches are created by other clients or the server.</p>
         <strong>Example (JavaScript):</strong>
         <pre><code>const socket = new WebSocket("ws://localhost:8080/ws/subscribe");
 
@@ -128,7 +165,7 @@ socket.onerror = function(error) {
 
     <hr>
     <footer>
-        &copy; 2025 Big GiantBaby 大牛大巨婴. 本App采用 <a href="https://creativecommons.org/licenses/by-sa/4.0/" target="_blank" rel="noopener noreferrer">CC BY-SA 4.0</a> 协议许可。  
+        &copy; 2025 Big GiantBaby 大牛大巨婴. 本App采用 <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener noreferrer">MIT license</a> 协议许可。  
         您可以在保留署名的前提下自由分享与修改。
     </footer> 
 </body>

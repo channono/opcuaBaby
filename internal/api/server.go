@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/csv"
 	"log"
 	"net/http"
 	"strings"
@@ -32,6 +33,8 @@ type Client struct {
 	send chan *controller.WatchItem
 	// A map of nodeIDs the client is subscribed to.
 	subscriptions map[string]bool
+	// If true, client receives all watch updates regardless of per-node subscriptions
+	subscribeAll bool
 	mu            sync.RWMutex
 }
 
@@ -79,7 +82,9 @@ func (h *Hub) run(context.Context) {
 			h.mu.Unlock()
 		case <-ctrlDone:
 			// OPC UA client context cancelled; close all clients and reset broadcast
-			log.Println("Hub: OPC UA client context done, closing websocket clients.")
+			if !h.controller.IsLogDisabled() {
+				log.Println("Hub: OPC UA client context done, closing websocket clients.")
+			}
 			h.mu.Lock()
 			for client := range h.clients {
 				close(client.send)
@@ -92,7 +97,9 @@ func (h *Hub) run(context.Context) {
 			if !ok {
 				// The broadcast channel was closed by the controller, indicating a disconnect.
 				// Close all client connections.
-				log.Println("Hub: Controller disconnected, closing all websocket clients.")
+				if !h.controller.IsLogDisabled() {
+					log.Println("Hub: Controller disconnected, closing all websocket clients.")
+				}
 				h.mu.Lock()
 				for client := range h.clients {
 					close(client.send)
@@ -110,15 +117,18 @@ func (h *Hub) run(context.Context) {
 			h.mu.Lock()
 			for client := range h.clients {
 				client.mu.RLock()
-				if client.subscriptions[message.NodeID] {
+				forward := client.subscribeAll || client.subscriptions[message.NodeID]
+				client.mu.RUnlock()
+				if forward {
 					select {
 					case client.send <- message:
 					default:
 						close(client.send)
+						h.mu.Lock()
 						delete(h.clients, client)
+						h.mu.Unlock()
 					}
 				}
-				client.mu.RUnlock()
 			}
 			h.mu.Unlock()
 		case <-h.stop:
@@ -135,7 +145,7 @@ func (h *Hub) run(context.Context) {
 
 // WebSocketMessage defines the structure for messages between client and server.
 type WebSocketMessage struct {
-	Action  string   `json:"action"` // "subscribe" or "unsubscribe"
+	Action  string   `json:"action"` // "subscribe", "unsubscribe", "subscribe_all", "unsubscribe_all"
 	NodeIDs []string `json:"node_ids"`
 }
 
@@ -160,12 +170,35 @@ func (c *Client) readPump() {
 		case "subscribe":
 			for _, nodeID := range msg.NodeIDs {
 				c.subscriptions[nodeID] = true
+				// Ensure a server-side watch exists
 				go c.hub.controller.AddWatch(nodeID)
+				// Send current snapshot to this client immediately (best effort)
+				go func(nid string) {
+					attrs, err := c.hub.controller.ReadNodeAttributes(nid)
+					if err == nil && attrs != nil {
+						now := time.Now().Format("15:04:05.000")
+						wi := &controller.WatchItem{
+							NodeID:    attrs.NodeID,
+							Name:      attrs.Name,
+							DataType:  attrs.DataType,
+							Value:     attrs.Value,
+							Timestamp: now,
+						}
+						select {
+						case c.send <- wi:
+						default:
+						}
+					}
+				}(nodeID)
 			}
 		case "unsubscribe":
 			for _, nodeID := range msg.NodeIDs {
 				delete(c.subscriptions, nodeID)
 			}
+		case "subscribe_all":
+			c.subscribeAll = true
+		case "unsubscribe_all":
+			c.subscribeAll = false
 		}
 		c.mu.Unlock()
 	}
@@ -194,6 +227,67 @@ func StartServer(ctx context.Context, ctrl controller.NodeManager, apiStatus *st
 	// REST API endpoints
 	api := router.Group("/api/v1")
 	{
+		// Export all Variable nodes in the address space
+		api.GET("/export/tags", func(c *gin.Context) {
+			controllerCtx := hub.controller.GetClientContext()
+			if controllerCtx == nil || controllerCtx.Err() != nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "OPC UA connection is not active"})
+				return
+			}
+			format := strings.ToLower(strings.TrimSpace(c.Query("format")))
+			if format == "" { format = "json" }
+			tags, err := ctrl.CollectVariableNodes("", true)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			if format == "csv" {
+				c.Header("Content-Disposition", "attachment; filename=tags_all.csv")
+				c.Header("Content-Type", "text/csv; charset=utf-8")
+				w := csv.NewWriter(c.Writer)
+				defer w.Flush()
+				_ = w.Write([]string{"NodeID","Name","DataType","Description","Path"})
+				for _, t := range tags { _ = w.Write([]string{t.NodeID, t.Name, t.DataType, t.Description, t.Path}) }
+				return
+			}
+			c.JSON(http.StatusOK, tags)
+		})
+
+		// Export Variable nodes under a specific folder
+		api.GET("/export/tags/folder", func(c *gin.Context) {
+			controllerCtx := hub.controller.GetClientContext()
+			if controllerCtx == nil || controllerCtx.Err() != nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "OPC UA connection is not active"})
+				return
+			}
+			nodeID := strings.TrimSpace(c.Query("node_id"))
+			if nodeID == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "node_id is required"})
+				return
+			}
+			recursive := true
+			if rv := c.Query("recursive"); rv != "" {
+				recursive = rv != "false" && rv != "0"
+			}
+			format := strings.ToLower(strings.TrimSpace(c.Query("format")))
+			if format == "" { format = "json" }
+			tags, err := ctrl.CollectVariableNodes(nodeID, recursive)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			if format == "csv" {
+				c.Header("Content-Disposition", "attachment; filename=tags_folder.csv")
+				c.Header("Content-Type", "text/csv; charset=utf-8")
+				w := csv.NewWriter(c.Writer)
+				defer w.Flush()
+				_ = w.Write([]string{"NodeID","Name","DataType","Description","Path"})
+				for _, t := range tags { _ = w.Write([]string{t.NodeID, t.Name, t.DataType, t.Description, t.Path}) }
+				return
+			}
+			c.JSON(http.StatusOK, tags)
+		})
+
 		api.POST("/read", func(c *gin.Context) {
 			controllerCtx := hub.controller.GetClientContext()
 			if controllerCtx == nil || controllerCtx.Err() != nil {
@@ -251,7 +345,9 @@ func StartServer(ctx context.Context, ctrl controller.NodeManager, apiStatus *st
 		}
 		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
-			log.Printf("Failed to set websocket upgrade: %+v", err)
+			if !hub.controller.IsLogDisabled() {
+				log.Printf("Failed to set websocket upgrade: %+v", err)
+			}
 			return
 		}
 		client := &Client{
@@ -323,7 +419,9 @@ func StartServer(ctx context.Context, ctrl controller.NodeManager, apiStatus *st
 		*apiStatus = "Running on :" + port
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			*apiStatus = "Error: " + err.Error()
-			log.Printf("listen: %s\n", err)
+			if !hub.controller.IsLogDisabled() {
+				log.Printf("listen: %s\n", err)
+			}
 		}
 	}()
 
@@ -334,7 +432,9 @@ func StartServer(ctx context.Context, ctrl controller.NodeManager, apiStatus *st
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			log.Printf("Server Shutdown Failed:%+v", err)
+			if !hub.controller.IsLogDisabled() {
+				log.Printf("Server Shutdown Failed:%+v", err)
+			}
 		}
 	}()
 

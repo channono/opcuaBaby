@@ -1,0 +1,17 @@
+{
+  "EndpointURL": "opc.tcp://127.0.0.1:4840",
+  "SecurityPolicy": "Auto",
+  "SecurityMode": "Auto",
+  "AuthMode": "Anonymous",
+  "Username": "",
+  "Password": "",
+  "CertFile": "",
+  "KeyFile": "",
+  "session_timeout": 30,
+  "ApiPort": "8080",
+  "ApiEnabled": true,
+  "DisableLog": false,
+  "AutoConnect": false,
+  "connect_timeout": 5,
+  "language": "zh"
+}

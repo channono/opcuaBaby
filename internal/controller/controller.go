@@ -61,6 +61,8 @@ type NodeManager interface {
 	AddWatch(nodeID string)
 	GetApiBroadcastChan() chan *WatchItem
 	GetClientContext() context.Context
+	IsLogDisabled() bool
+	CollectVariableNodes(parentID string, recursive bool) ([]*ExportTag, error)
 }
 
 // ApiServerStarter defines the function signature for starting the API server.
@@ -102,6 +104,15 @@ type NodeAttributes struct {
 	AccessLevel string
 	Value       string
 	ValueRank   int // -1: scalar; 0 or >0: array (0 = any dims, >0 = number of dimensions)
+}
+
+// ExportTag represents a tag for export
+type ExportTag struct {
+    NodeID      string `json:"node_id"`
+    Name        string `json:"name"`
+    DataType    string `json:"data_type,omitempty"`
+    Description string `json:"description,omitempty"`
+    Path        string `json:"path,omitempty"`
 }
 
 type Controller struct {
@@ -162,6 +173,10 @@ func New() *Controller {
 }
 
 func (c *Controller) Log(msg string) {
+    // Respect DisableLog when configured
+    if c.currentConfig != nil && c.currentConfig.DisableLog {
+        return
+    }
     c.logMu.Lock()
     defer c.logMu.Unlock()
     select {
@@ -170,14 +185,24 @@ func (c *Controller) Log(msg string) {
     }
 }
 
+// IsLogDisabled reports whether logs should be suppressed based on current config
+func (c *Controller) IsLogDisabled() bool {
+    c.mu.RLock()
+    cfg := c.currentConfig
+    c.mu.RUnlock()
+    return cfg != nil && cfg.DisableLog
+}
+
 func (c *Controller) Connect(cfg *opc.Config) error {
     c.mu.Lock()
     if c.isConnected || c.isConnecting {
         c.mu.Unlock()
+        c.Log("[yellow]Connect skipped: already connected or connecting[-]")
         return nil
     }
     c.isConnecting = true
     c.mu.Unlock()
+    c.Log(fmt.Sprintf("[cyan]Connecting to %s...[-]", cfg.EndpointURL))
 
     // Create lifecycle context
     c.clientLifecycleMutex.Lock()
@@ -190,35 +215,84 @@ func (c *Controller) Connect(cfg *opc.Config) error {
     c.clientLifecycleMutex.Unlock()
 
     // Create opc client
-    cli, err := opc.NewClient(cfg.EndpointURL)
-    if err != nil {
+    // Up to 3 attempts
+    const attempts = 3
+    var lastErr error
+    for i := 1; i <= attempts; i++ {
+        cli, err := opc.NewClient(cfg.EndpointURL)
+        if err != nil {
+            lastErr = err
+            c.Log(fmt.Sprintf("[red]Connect attempt %d/%d: failed to create client: %v[-]", i, attempts, err))
+            if i < attempts {
+                time.Sleep(1 * time.Second)
+                continue
+            }
+            break
+        }
+        // Set data change handler and connect
+        cli.Handler = c
+        // Apply connect timeout if configured
+        connectCtx := ctx
+        var tCancel context.CancelFunc
+        if cfg.ConnectTimeout > 0 {
+            d := time.Duration(cfg.ConnectTimeout*1000) * time.Millisecond
+            connectCtx, tCancel = context.WithTimeout(ctx, d)
+        }
+        err = cli.Connect(connectCtx)
+        if tCancel != nil {
+            tCancel()
+        }
+        if err != nil {
+            lastErr = err
+            // Detect timeout: context deadline or errors implementing Timeout() bool
+            isTimeout := errors.Is(err, context.DeadlineExceeded)
+            if !isTimeout {
+                if te, ok := any(err).(interface{ Timeout() bool }); ok && te.Timeout() {
+                    isTimeout = true
+                }
+            }
+            if isTimeout {
+                c.Log(fmt.Sprintf("[red]Connect attempt %d/%d timeout after %.1fs to %s[-]", i, attempts, cfg.ConnectTimeout, cfg.EndpointURL))
+            } else {
+                c.Log(fmt.Sprintf("[red]Connect attempt %d/%d failed: %v[-]", i, attempts, err))
+            }
+            // Best effort disconnect if Connect partially established
+            _ = cli.Disconnect(context.Background())
+            if i < attempts {
+                c.Log("[yellow]Retrying connect...[-]")
+                time.Sleep(1 * time.Second)
+                continue
+            }
+            break
+        }
+        // Success
         c.mu.Lock()
+        c.client = cli
+        c.isConnected = true
         c.isConnecting = false
         c.mu.Unlock()
-        return err
+        c.Log(fmt.Sprintf("[green]Connected to %s[-]", cfg.EndpointURL))
+        if c.OnConnectionStateChange != nil {
+            c.OnConnectionStateChange(true, cfg.EndpointURL, nil)
+        }
+        // Start throttled watch list update pump
+        c.startWatchUpdatePump()
+        // Kick initial browse of RootFolder if available
+        go c.Browse("i=84")
+        return nil
     }
-    // Set data change handler and connect
-    cli.Handler = c
-    if err := cli.Connect(ctx); err != nil {
-        c.mu.Lock()
-        c.isConnecting = false
-        c.mu.Unlock()
-        return err
-    }
+    // Final failure
     c.mu.Lock()
-    c.client = cli
-    c.isConnected = true
     c.isConnecting = false
     c.mu.Unlock()
-
-    if c.OnConnectionStateChange != nil {
-        c.OnConnectionStateChange(true, cfg.EndpointURL, nil)
+    if lastErr == nil {
+        lastErr = fmt.Errorf("connect failed")
     }
-    // Start throttled watch list update pump
-    c.startWatchUpdatePump()
-    // Kick initial browse of RootFolder if available
-    go c.Browse("i=84")
-    return nil
+    c.Log(fmt.Sprintf("[red]Connect failed after %d attempts: %v[-]", attempts, lastErr))
+    if c.OnConnectionStateChange != nil {
+        c.OnConnectionStateChange(false, cfg.EndpointURL, lastErr)
+    }
+    return lastErr
 }
 
 func (c *Controller) Disconnect() {
@@ -238,6 +312,30 @@ func (c *Controller) Disconnect() {
     c.isConnected = false
     c.isConnecting = false
     c.mu.Unlock()
+
+    // Close and recreate API broadcast channel to notify Hub and future sessions get a fresh channel
+    c.mu.Lock()
+    oldBroadcast := c.ApiBroadcastChan
+    c.ApiBroadcastChan = make(chan *WatchItem, 64)
+    c.mu.Unlock()
+    if oldBroadcast != nil {
+        close(oldBroadcast)
+    }
+
+    // Clear all watches (also closes any active subscriptions) and notify UI
+    c.RemoveAllWatches()
+
+    // Clear address space caches and browsing flags
+    c.addressSpaceMutex.Lock()
+    c.addressSpaceNodes = make(map[string]*AddressSpaceNode)
+    c.addressSpaceChildren = make(map[string][]string)
+    c.addressSpaceMutex.Unlock()
+    c.mu.Lock()
+    c.browsingNodes = make(map[string]bool)
+    c.noChildrenCached = make(map[string]bool)
+    c.mu.Unlock()
+
+    c.Log("[yellow]Disconnected[-]")
     if c.OnConnectionStateChange != nil {
         c.OnConnectionStateChange(false, "", nil)
     }
@@ -246,26 +344,123 @@ func (c *Controller) Disconnect() {
     }
 }
 
+// Shutdown stops the API server (if running) and disconnects the OPC UA client, ensuring all state is cleared.
+func (c *Controller) Shutdown() {
+    // Stop API server
+    if c.apiServerCancel != nil {
+        c.apiServerCancel()
+    }
+    c.apiServer = nil
+    c.apiServerCtx = nil
+    c.apiServerCancel = nil
+
+    // Disconnect OPC UA client and clear state
+    c.Disconnect()
+}
 
 func (c *Controller) GetApiBroadcastChan() chan *WatchItem { return c.ApiBroadcastChan }
 
 func (c *Controller) GetClientContext() context.Context { return c.clientCtx }
 
+// ... (rest of the code remains the same)
 func (c *Controller) Browse(parentID string) {
+    // Prevent duplicate browse for the same node
     c.mu.Lock()
     if c.browsingNodes[parentID] {
         c.mu.Unlock()
         return
     }
     c.browsingNodes[parentID] = true
+    ctx := c.clientCtx
+    client := c.client
     c.mu.Unlock()
 
-    // In real code, perform OPC UA browse and fill c.addressSpaceChildren/Nodes
-    // Here just signal update without modification
+    // Validate state
+    if client == nil || ctx == nil {
+        c.Log(fmt.Sprintf("[red]Browse aborted for %s: client not connected[-]", parentID))
+        c.mu.Lock()
+        c.browsingNodes[parentID] = false
+        c.mu.Unlock()
+        return
+    }
+
+    // Parse the parent node id
+    nID, err := ua.ParseNodeID(parentID)
+    if err != nil {
+        c.Log(fmt.Sprintf("[red]Invalid NodeID '%s': %v[-]", parentID, err))
+        c.mu.Lock()
+        c.browsingNodes[parentID] = false
+        c.mu.Unlock()
+        return
+    }
+
+    // Perform browse with timeout
+    browseCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+    defer cancel()
+    refs, err := client.Browse(browseCtx, nID)
+    if err != nil {
+        c.Log(fmt.Sprintf("[red]Browse failed for %s: %v[-]", parentID, err))
+        c.mu.Lock()
+        c.browsingNodes[parentID] = false
+        c.mu.Unlock()
+        return
+    }
+
+    // Build children list and node entries
+    children := make([]string, 0, len(refs))
+    nodes := make(map[string]*AddressSpaceNode, len(refs))
+    for _, ref := range refs {
+        if ref == nil || ref.NodeID == nil {
+            continue
+        }
+        var childID string
+        // Prefer concrete NodeID if available
+        if ref.NodeID.NodeID != nil {
+            childID = ref.NodeID.NodeID.String()
+        } else {
+            // Fallback to expanded form string
+            childID = ref.NodeID.String()
+        }
+        if childID == "" {
+            continue
+        }
+        name := ""
+        if ref.DisplayName.Text != "" {
+            name = ref.DisplayName.Text
+        } else {
+            name = childID
+        }
+
+        hasChildren := ref.NodeClass != ua.NodeClassVariable && ref.NodeClass != ua.NodeClassMethod
+        nodes[childID] = &AddressSpaceNode{
+            NodeID:      childID,
+            Name:        name,
+            NodeClass:   ref.NodeClass,
+            HasChildren: hasChildren,
+        }
+        children = append(children, childID)
+    }
+
+    // Sort children by name for stable UI ordering
+    sort.Slice(children, func(i, j int) bool {
+        return nodes[children[i]].Name < nodes[children[j]].Name
+    })
+
+    // Commit to controller caches
+    c.addressSpaceMutex.Lock()
+    for id, n := range nodes {
+        c.addressSpaceNodes[id] = n
+    }
+    c.addressSpaceChildren[parentID] = children
+    c.addressSpaceMutex.Unlock()
+
+    // Notify UI there are updates for this parent
     select {
     case c.AddressSpaceUpdateChan <- parentID:
     default:
     }
+
+    // Clear browsing flag
     c.mu.Lock()
     c.browsingNodes[parentID] = false
     c.mu.Unlock()
@@ -299,20 +494,161 @@ func (c *Controller) GetNode(id string) *AddressSpaceNode {
     return n
 }
 
+// CollectVariableNodes collects Variable-class nodes under the given parent. If parentID is empty,
+// it attempts to walk the entire known address space starting from RootFolder (i=84).
+// It performs best-effort browsing on demand. It respects connection state and client context.
+func (c *Controller) CollectVariableNodes(parentID string, recursive bool) ([]*ExportTag, error) {
+    // Connection gating
+    c.mu.RLock()
+    ctx := c.clientCtx
+    cli := c.client
+    c.mu.RUnlock()
+    if cli == nil || ctx == nil {
+        return nil, fmt.Errorf("not connected")
+    }
+
+    // Determine start IDs
+    startIDs := []string{}
+    if parentID == "" {
+        startIDs = []string{"i=84"} // RootFolder
+    } else {
+        startIDs = []string{parentID}
+    }
+
+    // Iterative BFS to avoid deep recursion and leaks
+    queue := make([]string, 0, 64)
+    visited := make(map[string]bool)
+    queue = append(queue, startIDs...)
+
+    tags := make([]*ExportTag, 0, 256)
+    deadline := time.After(30 * time.Second) // safeguard
+
+    for len(queue) > 0 {
+        select {
+        case <-ctx.Done():
+            return tags, ctx.Err()
+        case <-deadline:
+            // Time-guard to prevent excessive blocking
+            return tags, fmt.Errorf("export traversal timeout")
+        default:
+        }
+
+        id := queue[0]
+        queue = queue[1:]
+        if visited[id] {
+            continue
+        }
+        visited[id] = true
+
+        // Ensure we have children cached; if unknown and recursive, try to browse
+        ch := c.GetAddressSpaceChildren(id)
+        if recursive && len(ch) == 0 {
+            // best effort browse to populate
+            c.Browse(id)
+            // small wait to allow browse to complete
+            time.Sleep(20 * time.Millisecond)
+            ch = c.GetAddressSpaceChildren(id)
+        }
+
+        // If this node is Variable, add to tags
+        if n := c.GetNode(id); n != nil {
+            if n.NodeClass == ua.NodeClassVariable {
+                // Best-effort attributes
+                var dt, desc string
+                if attrs, err := c.ReadNodeAttributes(id); err == nil && attrs != nil {
+                    dt = attrs.DataType
+                    desc = attrs.Description
+                }
+                tags = append(tags, &ExportTag{
+                    NodeID:      id,
+                    Name:        n.Name,
+                    DataType:    dt,
+                    Description: desc,
+                })
+            }
+        }
+
+        if recursive {
+            // Enqueue children
+            for _, child := range ch {
+                if !visited[child] {
+                    queue = append(queue, child)
+                }
+            }
+        }
+    }
+
+    return tags, nil
+}
+
 func (c *Controller) AddWatch(nodeID string) {
+    // Validate connection first
+    c.mu.RLock()
+    cli := c.client
+    c.mu.RUnlock()
+    if cli == nil {
+        c.Log(fmt.Sprintf("[red]AddWatch failed: not connected (node %s)[-]", nodeID))
+        return
+    }
+
+    // Create entry or return if exists
     c.mu.Lock()
     if _, exists := c.watchItems[nodeID]; exists {
         c.mu.Unlock()
         return
     }
-    wi := &WatchItem{NodeID: nodeID, Name: nodeID, DataType: "", Value: "", Timestamp: time.Now().Format("15:04:05.000")}
+    wi := &WatchItem{NodeID: nodeID}
     c.watchItems[nodeID] = wi
-    // snapshot
-    items := make([]*WatchItem, 0, len(c.watchItems))
-    for _, it := range c.watchItems { items = append(items, it) }
-    cb := c.OnWatchListUpdate
     c.mu.Unlock()
-    if cb != nil { cb(items) }
+
+    // Populate fields from attributes (best-effort)
+    if attrs, err := c.ReadNodeAttributes(nodeID); err == nil && attrs != nil {
+        c.mu.Lock()
+        if it, ok := c.watchItems[nodeID]; ok {
+            it.Name = attrs.Name
+            it.DataType = attrs.DataType
+            it.Value = attrs.Value
+            it.Timestamp = time.Now().Format("15:04:05.000")
+        }
+        c.mu.Unlock()
+    }
+
+    // Start monitoring value changes
+    sub, err := cli.MonitorItem(nodeID)
+    if err != nil {
+        c.Log(fmt.Sprintf("[red]Failed to monitor %s: %v[-]", nodeID, err))
+    } else {
+        c.mu.Lock()
+        if it, ok := c.watchItems[nodeID]; ok {
+            it.subHandle = sub
+        }
+        c.mu.Unlock()
+        c.Log(fmt.Sprintf("[green]Monitoring %s started[-]", nodeID))
+    }
+
+    // Push snapshot to UI
+    c.mu.RLock()
+    items := make([]*WatchItem, 0, len(c.watchItems))
+    for _, it := range c.watchItems {
+        items = append(items, it)
+    }
+    // Stable order by NodeID
+    sort.Slice(items, func(i, j int) bool { return items[i].NodeID < items[j].NodeID })
+    cb := c.OnWatchListUpdate
+    // Prepare API broadcast of the newly added item (shallow copy)
+    if it, ok := c.watchItems[nodeID]; ok {
+        msg := *it
+        // do not include subHandle in broadcast
+        msg.subHandle = nil
+        broadcast := c.ApiBroadcastChan
+        go func(m *WatchItem, ch chan *WatchItem) {
+            select { case ch <- m: default: }
+        }(&msg, broadcast)
+    }
+    c.mu.RUnlock()
+    if cb != nil {
+        cb(items)
+    }
 }
 
 func (c *Controller) GetClientForExport() *opc.Client {
@@ -382,8 +718,7 @@ func (c *Controller) HandleDataChange(nodeID string, dv *ua.DataValue) {
         item.Value = "<error: no data>"
         item.Timestamp = time.Now().Format("15:04:05.000")
         item.Severity = "Bad"
-        c.mu.Unlock()
-        return
+        // fall-through to notify UI below
     }
     if dv.Value != nil {
         item.Value = formatValue(dv.Value, item.DataType)
@@ -399,7 +734,27 @@ func (c *Controller) HandleDataChange(nodeID string, dv *ua.DataValue) {
     item.SemanticsChanged = semChanged
     item.InfoBits = infoBits
     item.RawCode = rawCode
+    // Snapshot for UI
+    items := make([]*WatchItem, 0, len(c.watchItems))
+    for _, wi := range c.watchItems { items = append(items, wi) }
+    sort.Slice(items, func(i, j int) bool { return items[i].NodeID < items[j].NodeID })
+    update := c.OnWatchListUpdate
+    // Prepare API broadcast message (shallow copy)
+    msg := *item
+    msg.subHandle = nil
+    broadcast := c.ApiBroadcastChan
     c.mu.Unlock()
+
+    // UI update
+    if update != nil {
+        update(items)
+    }
+    // Non-blocking API broadcast
+    select {
+    case broadcast <- &msg:
+    default:
+        // drop if channel is full to avoid blocking
+    }
 }
 
 func (c *Controller) RemoveWatch(nodeID string) {

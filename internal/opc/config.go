@@ -26,8 +26,10 @@ type Config struct {
 	SessionTimeout  uint32  `json:"session_timeout,omitempty"` // in seconds
 	ApiPort         string
 	ApiEnabled      bool // Enable/disable the API/web server
+	DisableLog      bool // When true, suppress UI/API logs
 	AutoConnect     bool // Automatically connect on startup
 	ConnectTimeout  float64 `json:"connect_timeout,omitempty"` // Connection timeout in seconds
+	Language        string  `json:"language,omitempty"` // UI language code: "en", "zh"
 }
 
 // ToOpcuaOptions converts the Config struct into a slice of opcua.Option
