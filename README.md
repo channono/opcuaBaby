@@ -47,14 +47,14 @@ Base path: `/api/v1`
   - POST `/read`
   - Body:
     ```json
-    { "node_id": "ns=2;i=10853" }
+    { "node_id": "ns=1;i=43335" }
     ```
 
 * __Write__
   - POST `/write`
   - Body:
     ```json
-    { "node_id": "ns=2;i=10853", "data_type": "Int32", "value": "123" }
+    { "node_id": "ns=1;i=43335", "data_type": "Int32", "value": "123" }
     ```
 
 ## WebSocket
@@ -63,8 +63,8 @@ Live updates for watched nodes.
 * __Endpoint__: `GET /ws/subscribe`
 * __Client control messages__ (JSON):
   ```json
-  { "action": "subscribe", "node_ids": ["ns=2;i=10853"] }
-  { "action": "unsubscribe", "node_ids": ["ns=2;i=10853"] }
+  { "action": "subscribe", "node_ids": ["ns=1;i=43335"] }
+  { "action": "unsubscribe", "node_ids": ["ns=1;i=43335"] }
   { "action": "subscribe_all" }
   { "action": "unsubscribe_all" }
   ```
