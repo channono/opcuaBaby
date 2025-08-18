@@ -231,8 +231,8 @@ func (c *Controller) Connect(cfg *opc.Config) error {
                         opcua.AuthAnonymous(),
                         opcua.ApplicationName("opcuababy"),
                     }
-                    // Use the endpoint's advertised URL to avoid server-side mismatch
-                    if epNone.EndpointURL != "" { connectURL = epNone.EndpointURL }
+                    // Always dial the user-provided URL to avoid unreachable advertised hostnames
+                    // (keep connectURL as cfg.EndpointURL)
                 }
             }
         }
@@ -379,9 +379,8 @@ func (c *Controller) Connect(cfg *opc.Config) error {
                         tryOpts = append(tryOpts, opcua.PrivateKey(rsaKey), opcua.Certificate(certDER))
                     }
 
-                    // Attempt connect using a temporary client to the endpoint's own URL
+                    // Attempt connect using the USER-PROVIDED URL (avoid advertised hostnames like localhost)
                     targetURL := cfg.EndpointURL
-                    if cand.ep != nil && cand.ep.EndpointURL != "" { targetURL = cand.ep.EndpointURL }
                     attempted++
                     c.Log(fmt.Sprintf("[yellow]Trying Username endpoint: %s / %s @ %s[-]", cand.ep.SecurityPolicyURI, cand.ep.SecurityMode.String(), targetURL))
                     tmpCli, cerr := opc.NewClient(targetURL, tryOpts...)

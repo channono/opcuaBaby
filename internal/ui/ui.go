@@ -1023,6 +1023,15 @@ func (ui *UI) onConnectClicked() {
 		return
 	}
 
+	// Normalize endpoint before connecting to ensure scheme/port are in place
+	if ui.config != nil {
+		norm := normalizeEndpoint(strings.TrimSpace(ui.config.EndpointURL))
+		ui.config.EndpointURL = norm
+		if ui.endpointEntry != nil {
+			ui.endpointEntry.SetText(norm)
+		}
+	}
+
 	// Disable button and show connecting state
 	ui.connectBtn.Disable()
 	ui.connectBtn.SetText(ui.t("connecting"))
@@ -1492,7 +1501,8 @@ func (ui *UI) showConfigDialog() {
 						return
 					}
 					sel := rows[id]
-					endpointEntry.SetText(sel.url)
+					// Do not overwrite the endpoint with the server-advertised URL; keep the user-entered address
+					endpointEntry.SetText(addr)
 					// Apply policy/mode if they are among our options
 					policySelect.SetSelected(sel.policy)
 					modeSelect.SetSelected(sel.mode)
