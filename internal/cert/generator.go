@@ -100,7 +100,7 @@ func GenerateCertificateFiles(config *CertificateConfig, certPath, keyPath strin
 
 // GetMobileStoragePath returns the appropriate storage path for certificates on mobile devices
 func GetMobileStoragePath() (string, error) {
-	var baseDir string
+    var baseDir string
 	
 	switch runtime.GOOS {
 	case "ios":
@@ -111,11 +111,21 @@ func GetMobileStoragePath() (string, error) {
 			baseDir = "/tmp"
 		}
 	case "android":
-		// On Android, use the app's internal storage
-		if homeDir, err := os.UserHomeDir(); err == nil {
+		// On Android, avoid relying on HOME which may be '/'. Prefer cache/config dirs.
+		if cacheDir, err := os.UserCacheDir(); err == nil && cacheDir != "" {
+			baseDir = cacheDir
+		} else if cfgDir, err := os.UserConfigDir(); err == nil && cfgDir != "" {
+			baseDir = cfgDir
+		} else if homeDir, err := os.UserHomeDir(); err == nil && homeDir != "" && homeDir != "/" {
 			baseDir = filepath.Join(homeDir, "files")
 		} else {
-			baseDir = "/data/data/com.giantbaby.opcuababy/files"
+			// Last resort: use process temp dir which is app-private on Android
+			baseDir = filepath.Join(os.TempDir(), "opcuababy")
+		}
+
+		// Never use external storage (no permissions). If path points to /sdcard or /storage, fallback to temp.
+		if strings.HasPrefix(baseDir, "/sdcard") || strings.HasPrefix(baseDir, "/storage") {
+			baseDir = filepath.Join(os.TempDir(), "opcuababy")
 		}
 	default:
 		// Desktop platforms - use visible directory

@@ -1195,6 +1195,7 @@ func (ui *UI) showConfigDialog() {
 		certPath, keyPath, err := cert.ForceGenerateCertificates()
 		if err != nil {
 			ui.controller.Log(fmt.Sprintf("[red]Failed to generate certificates: %v[-]", err))
+			dialog.ShowError(fmt.Errorf("failed to generate certificates: %v", err), ui.window)
 			return
 		}
 
