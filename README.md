@@ -32,7 +32,7 @@ Open Settings in the app to configure:
 * __API__: Port and enable/disable
 
 ### Simplified Certificates UI
-The certificate section contains only a single __Generate Certificates__ button. This generates and selects the local CA certificate and private key for the client security channel. No leaf client certificate/key is generated. Ensure your server trusts the generated CA certificate for secure connections.
+just one click Generate Certificates button. This generates and selects the local CA certificate and private key for the client security channel.  Ensure your server trusts the generated CA certificate for secure connections.
 
 ## REST API
 Base path: `/api/v1`
