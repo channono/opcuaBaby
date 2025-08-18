@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="108" height="108" viewBox="0 0 108 108" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Android Adaptive Icon Foreground - Abstract Baby Face</title>
+  <desc>Flat abstract baby face in cold bright blue, centered for adaptive icon foreground.</desc>
+  <defs></defs>
+  <g transform="translate(54 54)">
+    <path fill="#1EA7FF" fill-rule="evenodd" d="
+      M 34 0
+      A 34 34 0 1 0 -34 0
+      A 34 34 0 1 0 34 0
+
+      M -10.5 -3.5
+      A 4.8 4.8 0 1 0 -10.5 6.1
+      A 4.8 4.8 0 1 0 -10.5 -3.5
+
+      M 10.5 -3.5
+      A 4.8 4.8 0 1 0 10.5 6.1
+      A 4.8 4.8 0 1 0 10.5 -3.5
+
+      M -22 9
+      Q 0 26 22 9
+      Q 0 18 -22 9 Z
+
+      M -1.2 -19.5
+      Q 3.5 -23 7 -19.5
+      Q 2.8 -21.5 -1.2 -17.5 Z
+    "/>
+  </g>
+</svg>

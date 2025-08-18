@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"image/color"
 	"net"
+	"opcuababy/internal/cert"
 	"opcuababy/internal/controller"
 	"opcuababy/internal/exporter"
 	"opcuababy/internal/opc"
@@ -17,6 +18,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -28,126 +30,288 @@ import (
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"github.com/gopcua/opcua"
 	"github.com/gopcua/opcua/ua"
 )
 
-// Simple i18n dictionary. Extend as needed.
+// fontOnlyTheme delegates all visual aspects to the base theme, but overrides Font()
+// to use our embedded CJK font on iOS only. This preserves all visuals (colors, sizes,
+// icons, separators) while ensuring Chinese glyphs render correctly on iOS builds.
+type fontOnlyTheme struct{ base fyne.Theme }
+
+func (t *fontOnlyTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
+	switch n {
+	case theme.ColorNameSeparator:
+		return color.Transparent
+	case theme.ColorNameShadow:
+		return color.Transparent
+	case theme.ColorNameHover:
+		return color.Transparent
+	default:
+		return t.base.Color(n, v)
+	}
+}
+func (t *fontOnlyTheme) Icon(n fyne.ThemeIconName) fyne.Resource { return t.base.Icon(n) }
+func (t *fontOnlyTheme) Size(n fyne.ThemeSizeName) float32       { return t.base.Size(n) }
+func (t *fontOnlyTheme) Font(s fyne.TextStyle) fyne.Resource {
+	if runtime.GOOS == "ios" {
+		return CJKSubsetFont
+	}
+	return t.base.Font(s)
+}
+
+// Consistent large corner radius to match Apple-style rounded cards across platforms
+const (
+	appleCornerRadius float32 = 12.0
+	maxLogSegments    int     = 15000 // 大约对应几千行日志，可以按需调整
+)
+
+// ThemedPanel is a lightweight themed background with a subtle border that
+// automatically updates when the app theme changes. No polling or listeners needed:
+// Fyne will refresh widgets on theme change, triggering renderer.Refresh.
+type ThemedPanel struct {
+	widget.BaseWidget
+	app          fyne.App
+	strokeWidth  float32
+	cornerRadius float32
+	// fillColor provides the current fill color; defaults to theme.Background
+	fillColor func() color.Color
+	// inset will shrink the background by this many pixels on all sides
+	inset float32
+}
+
+func NewThemedPanel(app fyne.App) *ThemedPanel {
+	p := &ThemedPanel{app: app, strokeWidth: 1, cornerRadius: appleCornerRadius, inset: 1}
+	p.fillColor = func() color.Color { return theme.Color(theme.ColorNameBackground) }
+	p.ExtendBaseWidget(p)
+	return p
+}
+
+// NewThemedBackground returns a borderless themed background that still
+// responds to theme change events (used for the outermost background).
+func NewThemedBackground(app fyne.App) *ThemedPanel {
+	p := &ThemedPanel{app: app, strokeWidth: 0, cornerRadius: 0, inset: 0}
+	p.fillColor = func() color.Color { return theme.Color(theme.ColorNameBackground) }
+	p.ExtendBaseWidget(p)
+	return p
+}
+
+// NewThemedArea allows specifying a dynamic fill color function (e.g., using theme.Color(...)),
+// plus border width and corner radius.
+func NewThemedArea(app fyne.App, fill func() color.Color, strokeWidth, cornerRadius float32) *ThemedPanel {
+	p := &ThemedPanel{app: app, strokeWidth: strokeWidth, cornerRadius: cornerRadius, inset: 0}
+	p.fillColor = fill
+	p.ExtendBaseWidget(p)
+	return p
+}
+
+func (p *ThemedPanel) CreateRenderer() fyne.WidgetRenderer {
+	fill := theme.Color(theme.ColorNameBackground)
+	if p.fillColor != nil {
+		fill = p.fillColor()
+	}
+	rect := canvas.NewRectangle(fill)
+	rect.StrokeWidth = p.strokeWidth
+	// Initial stroke visible in both themes; exact value set in Refresh.
+	rect.StrokeColor = color.NRGBA{R: 220, G: 220, B: 220, A: 255}
+	rect.CornerRadius = p.cornerRadius
+	objs := []fyne.CanvasObject{rect}
+	return &themedPanelRenderer{panel: p, rect: rect, objects: objs}
+}
+
+type themedPanelRenderer struct {
+	panel   *ThemedPanel
+	rect    *canvas.Rectangle
+	objects []fyne.CanvasObject
+}
+
+func (r *themedPanelRenderer) Layout(size fyne.Size) {
+	if r.panel != nil && r.panel.inset > 0 {
+		inset := r.panel.inset
+		r.rect.Move(fyne.NewPos(inset, inset))
+		r.rect.Resize(fyne.NewSize(size.Width-2*inset, size.Height-2*inset))
+	} else {
+		r.rect.Move(fyne.NewPos(0, 0))
+		r.rect.Resize(size)
+	}
+}
+
+func (r *themedPanelRenderer) MinSize() fyne.Size {
+	return fyne.NewSize(10, 10)
+}
+
+func (r *themedPanelRenderer) Refresh() {
+	// Fill follows current theme
+	if r.panel.fillColor != nil {
+		r.rect.FillColor = r.panel.fillColor()
+	} else {
+		r.rect.FillColor = theme.Color(theme.ColorNameBackground)
+	}
+	// Rounded corners using configured radius
+	r.rect.CornerRadius = r.panel.cornerRadius
+	// Subtle border depends on theme variant
+	variant := theme.VariantLight
+	if r.panel != nil && r.panel.app != nil {
+		variant = r.panel.app.Settings().ThemeVariant()
+	}
+	if r.panel.strokeWidth <= 0 {
+		r.rect.StrokeWidth = 0
+		r.rect.StrokeColor = color.Transparent
+	} else {
+		r.rect.StrokeWidth = r.panel.strokeWidth
+		if variant == theme.VariantDark {
+			r.rect.StrokeColor = color.NRGBA{R: 70, G: 70, B: 70, A: 160}
+		} else {
+			r.rect.StrokeColor = color.NRGBA{R: 220, G: 220, B: 220, A: 255}
+		}
+	}
+	canvas.Refresh(r.rect)
+}
+
+func (r *themedPanelRenderer) BackgroundColor() color.Color { return color.Transparent }
+func (r *themedPanelRenderer) Objects() []fyne.CanvasObject { return r.objects }
+func (r *themedPanelRenderer) Destroy()                     {}
+
 var i18n = map[string]map[string]string{
 	"en": {
-		"endpoint":        "Endpoint",
-		"address_space":   "Address Space",
-		"connect":         "Connect",
-		"disconnect":      "Disconnect",
-		"connecting":      "Connecting...",
-		"settings":        "Settings",
-		"export":          "Export",
-		"add_to_watch":    "Add to Watch",
-		"write_value":     "Write Value",
-		"remove":          "Remove",
-		"write":           "Write",
-		"export_dialog":   "Export Address Space",
-		"format":          "Format",
-		"scope":           "Scope",
-		"all":             "All",
-		"folder":          "Folder",
-		"folder_nodeid":   "Folder NodeID",
-		"recursive":       "Recursive",
-		"options":         "Options",
+		"endpoint":            "Endpoint",
+		"address_space":       "Address Space",
+		"connect":             "Connect",
+		"disconnect":          "Disconnect",
+		"connecting":          "Connecting...",
+		"settings":            "Settings",
+		"export":              "Export",
+		"add_to_watch":        "Add to Watch",
+		"write_value":         "Write Value",
+		"remove":              "Remove",
+		"write":               "Write",
+		"export_dialog":       "Export Address Space",
+		"format":              "Format",
+		"scope":               "Scope",
+		"all":                 "All",
+		"folder":              "Folder",
+		"folder_nodeid":       "Folder NodeID",
+		"recursive":           "Recursive",
+		"options":             "Options",
 		"folder_nodeid_error": "Please enter a valid Folder NodeID",
-		"export_btn":      "Export",
-		"cancel_btn":      "Cancel",
-		"language":        "Language",
-		"lang_en":         "English",
-		"lang_zh":         "中文",
-		"watch_list":      "Watch List",
-		"selected_details": "Selected Node Details",
-		"logs":            "Logs",
-		"clear_all":       "Clear All",
-		"clear_logs":      "Clear Logs",
-		"copy":            "Copy",
-        "running_on":     "Running on",
+		"export_btn":          "Export",
+		"cancel_btn":          "Cancel",
+		"language":            "Language",
+		"lang_en":             "English",
+		"lang_zh":             "中文",
+		"watch_list":          "Watch List",
+		"selected_details":    "Attribute",
+		"logs":                "Logs",
+		"clear_all":           "Clear All",
+		"clear_logs":          "Clear Logs",
+		"copy":                "Copy",
+		"running_on":          "Running on",
+		// Auth mode labels (for localization of radio group)
+		"anonymous":          "Anonymous",
+		"username":           "Username",
+		"certificate":        "Certificate",
+		"api_disabled":       "API Disabled",
+		"api_server_stopped": "API Server Stopped",
 		// Settings dialog
-		"connection_settings": "Connection Settings",
-		"save_btn":            "Save",
-		"endpoint_url":        "Endpoint URL",
-		"application_uri":     "Application URI",
-		"product_uri":         "Product URI",
-		"session_timeout_s":   "Session Timeout (s)",
-		"connect_timeout_s":   "Connect Timeout (s)",
-		"security_policy":     "Security Policy",
-		"security_mode":       "Security Mode",
-		"authentication":      "Authentication",
-		"api_port":            "API Port",
-		"enable_api":          "Enable API/Web Server",
-		"auto_connect":        "Auto-connect on startup",
-		"disable_logs":        "Disable logs",
+		"connection_settings":     "Connection Settings",
+		"save_btn":                "Save",
+		"endpoint_url":            "Endpoint URL",
+		"discover_endpoints":      "Discover",
+		"discovering":             "Discovering...",
+		"select_endpoint":         "Select Endpoint",
+		"application_uri":         "Application URI",
+		"product_uri":             "Product URI",
+		"session_timeout_s":       "Session Timeout (s)",
+		"connect_timeout_s":       "Connect Timeout (s)",
+		"security_policy":         "Security Policy",
+		"security_mode":           "Security Mode",
+		"authentication":          "Authentication",
+		"api_port":                "API Port",
+		"enable_api":              "Enable API/Web Server",
+		"auto_connect":            "Auto-connect on startup",
+		"disable_logs":            "Disable logs",
 		"placeholder_app_uri":     "urn:hostname:client",
 		"placeholder_product_uri": "urn:your-company:product",
-		"placeholder_api_port":    "e.g., 8080",
+		"placeholder_api_port":    "e.g.,8080",
 		"placeholder_timeout_s":   "in seconds",
 		"placeholder_username":    "Username",
 		"placeholder_password":    "Password",
 		"placeholder_cert_file":   "Client certificate file (.der/.crt)",
 		"placeholder_key_file":    "Private key file (.key/.pem)",
-		"browse":                   "Browse...",
+		"browse":                  "Browse...",
+		"auto_generate_cert":      "Auto-generate certificates",
+		"generate_cert":           "Generate Certificates",
+		"cert_info":               "Certificate Info",
 	},
 	"zh": {
-		"endpoint":        "服务端地址",
-		"address_space":   "地址空间",
-		"connect":         "连接",
-		"disconnect":      "断开",
-		"connecting":      "连接中...",
-		"settings":        "设置",
-		"export":          "导出",
-		"add_to_watch":    "加入监视",
-		"write_value":     "写入数值",
-		"remove":          "移除",
-		"write":           "写入",
-		"export_dialog":   "导出地址空间",
-		"format":          "格式",
-		"scope":           "范围",
-		"all":             "全部",
-		"folder":          "文件夹",
-		"folder_nodeid":   "文件夹 NodeID",
-		"recursive":       "递归",
-		"options":         "选项",
-		"folder_nodeid_error": "请输入有效的文件夹 NodeID",
-		"export_btn":      "导出",
-		"cancel_btn":      "取消",
-		"language":        "语言",
-		"lang_en":         "英文",
-		"lang_zh":         "中文",
-		"watch_list":      "监视列表",
-		"selected_details": "属性",
-		"logs":            "日志",
-		"clear_all":       "清空全部",
-		"clear_logs":      "清空日志",
-		"copy":            "复制",
-        "running_on":     "运行在",
+		"endpoint":            "服务端地址",
+		"address_space":       "地址空间",
+		"connect":             "连接",
+		"disconnect":          "断开",
+		"connecting":          "连接中...",
+		"settings":            "设置",
+		"export":              "导出",
+		"add_to_watch":        "加入监视",
+		"write_value":         "写入数值",
+		"remove":              "移除",
+		"write":               "写入",
+		"export_dialog":       "导出地址空间",
+		"format":              "格式",
+		"scope":               "范围",
+		"all":                 "全部",
+		"folder":              "文件夹",
+		"folder_nodeid":       "文件夹NodeID",
+		"recursive":           "递归",
+		"options":             "选项",
+		"folder_nodeid_error": "请输入有效的文件夹NodeID",
+		"export_btn":          "导出",
+		"cancel_btn":          "取消",
+		"language":            "语言",
+		"lang_en":             "英文",
+		"lang_zh":             "中文",
+		"watch_list":          "监视列表",
+		"selected_details":    "属性",
+		"logs":                "日志",
+		"clear_all":           "清空全部",
+		"clear_logs":          "清空日志",
+		"copy":                "复制",
+		"running_on":          "运行在",
+		// Auth mode labels
+		"anonymous":          "匿名",
+		"username":           "用户名",
+		"certificate":        "证书",
+		"api_disabled":       "API已禁用",
+		"api_server_stopped": "API服务已停止",
 		// Settings dialog
-		"connection_settings": "连接设置",
-		"save_btn":            "保存",
-		"endpoint_url":        "服务端地址",
-		"application_uri":     "应用 URI",
-		"product_uri":         "产品 URI",
-		"session_timeout_s":   "会话超时(秒)",
-		"connect_timeout_s":   "连接超时(秒)",
-		"security_policy":     "安全策略",
-		"security_mode":       "安全模式",
-		"authentication":      "认证方式",
-		"api_port":            "API 端口",
-		"enable_api":          "启用 API/网页服务",
-		"auto_connect":        "启动时自动连接",
-		"disable_logs":        "禁用日志",
+		"connection_settings":     "连接设置",
+		"save_btn":                "保存",
+		"endpoint_url":            "服务端地址",
+		"discover_endpoints":      "发现端点",
+		"discovering":             "正在发现...",
+		"select_endpoint":         "选择端点",
+		"application_uri":         "应用URI",
+		"product_uri":             "产品URI",
+		"session_timeout_s":       "会话超时(秒)",
+		"connect_timeout_s":       "连接超时(秒)",
+		"security_policy":         "安全策略",
+		"security_mode":           "安全模式",
+		"authentication":          "认证方式",
+		"api_port":                "API端口",
+		"enable_api":              "启用 API/网页服务",
+		"auto_connect":            "启动时自动连接",
+		"disable_logs":            "关闭日志",
 		"placeholder_app_uri":     "urn:hostname:client",
 		"placeholder_product_uri": "urn:your-company:product",
-		"placeholder_api_port":    "例如 8080",
-		"placeholder_timeout_s":   "单位：秒",
+		"placeholder_api_port":    "例如,8080",
+		"placeholder_timeout_s":   "单位:秒",
 		"placeholder_username":    "用户名",
 		"placeholder_password":    "密码",
 		"placeholder_cert_file":   "客户端证书文件 (.der/.crt)",
 		"placeholder_key_file":    "私钥文件 (.key/.pem)",
-		"browse":                   "浏览...",
+		"browse":                  "浏览...",
+		"auto_generate_cert":      "自动生成证书",
+		"generate_cert":           "生成证书",
+		"cert_info":               "证书信息",
 	},
 }
 
@@ -215,13 +379,18 @@ func (ui *UI) applyLanguage() {
 		ui.watchCard.SetTitle(ui.t("watch_list"))
 		ui.watchCard.Refresh()
 	}
-	if ui.detailsCard != nil {
-		ui.detailsCard.SetTitle(ui.t("selected_details"))
-		ui.detailsCard.Refresh()
+	if ui.detailsTitleLbl != nil {
+		ui.detailsTitleLbl.SetText(ui.t("selected_details"))
+		ui.detailsTitleLbl.Refresh()
 	}
 	if ui.logTitleLbl != nil {
 		ui.logTitleLbl.SetText(ui.t("logs"))
 		ui.logTitleLbl.Refresh()
+	}
+
+	// 当语言变化可能影响文本宽度时，更新详情表左列宽度
+	if ui.nodeInfoTable != nil {
+		ui.updateDetailsColumnWidths()
 	}
 }
 
@@ -238,6 +407,26 @@ func (ui *UI) t(key string) string {
 	return key
 }
 
+// localizeApiStatus maps backend English status strings to localized UI strings
+// and normalizes the "Running on" prefix using i18n.
+func (ui *UI) localizeApiStatus(s string) string {
+	if s == "API Disabled" {
+		return ui.t("api_disabled")
+	}
+	if s == "API Server Stopped" {
+		return ui.t("api_server_stopped")
+	}
+	if strings.HasPrefix(s, "Running on :") {
+		suffix := strings.TrimPrefix(s, "Running on :")
+		return ui.t("running_on") + ":" + suffix
+	}
+	if strings.HasPrefix(s, "Running on:") {
+		suffix := strings.TrimPrefix(s, "Running on:")
+		return ui.t("running_on") + ":" + suffix
+	}
+	return s
+}
+
 var (
 	// Icon for the root of the tree (the connection itself)
 	rootIconResource = fyne.NewStaticResource("root_icon_color.svg", []byte(`
@@ -251,7 +440,8 @@ var (
 		<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180" width="180" height="180"    >
 			<path d="M 45 79 L 90 100.61 L 90 157.39 L 45 179 L 0 157.39 L 0 100.61 Z" fill="#60a917" />
 			<path d="M 89 0 L 134 21.61 L 134 78.39 L 89 100 L 44 78.39 L 44 21.61 Z" fill="#a0522d" />
-			<path d="M 135 79 L 180 100.61 L 180 154.39 L 135 176 L 90 154.39 L 90 100.61 Z" fill="#1ba1e2"        </svg>`))
+			<path d="M 135 79 L 180 100.61 L 180 154.39 L 135 176 L 90 154.39 L 90 100.61 Z" fill="#1ba1e2"/>
+		</svg>`))
 
 	// Icon for special/example nodes like "HelloWorld"
 	specialIconResource = fyne.NewStaticResource("special_icon_color.svg", []byte(`
@@ -346,23 +536,24 @@ var (
 )
 
 type UI struct {
-    app        fyne.App
-    window     fyne.Window
-    controller *controller.Controller
+	app        fyne.App
+	window     fyne.Window
+	controller *controller.Controller
 
-    endpointEntry  *widget.Entry
-    connectBtn     *widget.Button
-    configBtn      *widget.Button
-    exportBtn      *widget.Button
-    statusIcon     *widget.Icon
-    apiStatusLabel *widget.Label
+	endpointEntry  *widget.Entry
+	connectBtn     *widget.Button
+	configBtn      *widget.Button
+	exportBtn      *widget.Button
+	statusIcon     *widget.Icon
+	apiStatusLabel *widget.Label
 
 	// Cards to allow retitling on language change
 	connectionCard   *widget.Card
 	addressSpaceCard *widget.Card
 	// Middle/Right panels
-	watchCard   *widget.Card
-	detailsCard *widget.Card
+	watchCard       *widget.Card
+	detailsCard     *widget.Card
+	detailsTitleLbl *widget.Label
 
 	// ...
 	config *opc.Config
@@ -406,11 +597,10 @@ type UI struct {
 	isConnected bool
 }
 
-const maxLogSegments = 15000 // 大约对应几千行日志，可以按需调整
-
 func NewUI(c *controller.Controller, apiStatus *string) *UI {
 	a := app.NewWithID("com.giantbaby.opcuababy") // Use App ID for storage
-	a.Settings().SetTheme(&compactTheme{})        // Restore the main theme
+	// Only change font on iOS; keep all other visuals from the default theme.
+	a.Settings().SetTheme(&fontOnlyTheme{base: theme.DefaultTheme()})
 	w := a.NewWindow("OPC UA Client - Big GiantBaby")
 	w.Resize(fyne.NewSize(1200, 800))
 
@@ -431,24 +621,27 @@ func NewUI(c *controller.Controller, apiStatus *string) *UI {
 		},
 		logBuilder: new(strings.Builder),
 		config: &opc.Config{
-			EndpointURL:    "opc.tcp://127.0.0.1:4840",
-			SecurityPolicy: "Auto",
-			SecurityMode:   "Auto",
-			AuthMode:       "Anonymous",
-			ApplicationURI: "",
-			ProductURI:     "",
-			SessionTimeout: 30,
-			ApiPort:        "8080",
-			ApiEnabled:     true,
-			ConnectTimeout: 5, // Default 5-second timeout
-			Language:       "en",
+			EndpointURL:      "opc.tcp://127.0.0.1:4840",
+			SecurityPolicy:   "Auto",
+			SecurityMode:     "Auto",
+			AuthMode:         "Anonymous",
+			ApplicationURI:   "",
+			ProductURI:       "",
+			SessionTimeout:   30,
+			ApiPort:          "8080",
+			ApiEnabled:       true,
+			ConnectTimeout:   5, // Default 5-second timeout
+			Language:         "en",
+			AutoGenerateCert: runtime.GOOS == "ios" || runtime.GOOS == "android", // Enable by default on mobile
 		},
 		apiStatusLabel: widget.NewLabel(*apiStatus),
 	}
 
 	ui.loadConfig()
 
+	// Set initial localized API status text
 	ui.initWidgets()
+	ui.apiStatusLabel.SetText(ui.localizeApiStatus(*apiStatus))
 	ui.initCallbacks()
 	ui.window.SetOnClosed(func() {
 		fmt.Println("Window is closing, initiating graceful shutdown...")
@@ -465,20 +658,12 @@ func NewUI(c *controller.Controller, apiStatus *string) *UI {
 		//    a.Quit()
 	})
 
+	// Periodically update and localize API status label
 	go func() {
 		for {
 			time.Sleep(1 * time.Second)
 			fyne.Do(func() {
-				s := *apiStatus
-				// Normalize both "Running on :" and "Running on:" formats
-				if strings.HasPrefix(s, "Running on :") {
-					suffix := strings.TrimPrefix(s, "Running on :")
-					s = ui.t("running_on") + " :" + suffix
-				} else if strings.HasPrefix(s, "Running on:") {
-					suffix := strings.TrimPrefix(s, "Running on:")
-					s = ui.t("running_on") + ":" + suffix
-				}
-				ui.apiStatusLabel.SetText(s)
+				ui.apiStatusLabel.SetText(ui.localizeApiStatus(*apiStatus))
 			})
 		}
 	}()
@@ -502,6 +687,7 @@ func NewUI(c *controller.Controller, apiStatus *string) *UI {
 		}
 	}()
 	ui.window.SetContent(ui.makeLayout())
+
 	if ui.config.AutoConnect {
 		go func() {
 			time.Sleep(500 * time.Millisecond)
@@ -559,7 +745,7 @@ func (ui *UI) initWidgets() {
 	ui.selectedNodeID = ""
 
 	ui.nodeTree.OnSelected = func(uid widget.TreeNodeID) {
-		ui.controller.Log(fmt.Sprintf("[blue]Tree OnSelected: %s[-]", string(uid)))
+		//ui.controller.Log(fmt.Sprintf("[blue]Tree OnSelected: %s[-]", string(uid)))
 		ui.selectedNodeID = uid
 		if uid == ui.virtualRoot {
 			return
@@ -570,7 +756,7 @@ func (ui *UI) initWidgets() {
 		go ui.controller.ReadNodeAttributes(string(uid))
 	}
 	ui.nodeTree.OnUnselected = func(uid widget.TreeNodeID) {
-		ui.controller.Log(fmt.Sprintf("[blue]Tree OnUnselected: %s[-]", string(uid)))
+		//ui.controller.Log(fmt.Sprintf("[blue]Tree OnUnselected: %s[-]", string(uid)))
 		if ui.selectedNodeID == uid {
 			ui.selectedNodeID = ""
 			ui.resetNodeDetails()
@@ -608,8 +794,8 @@ func (ui *UI) initWidgets() {
 			}
 		},
 	)
-	ui.nodeInfoTable.SetColumnWidth(0, 110)
-	ui.nodeInfoTable.SetColumnWidth(1, 200)
+	// 自适应设置左列宽度，保证能容纳属性名称
+	ui.updateDetailsColumnWidths()
 
 	ui.watchTable = widget.NewTable(
 		func() (int, int) {
@@ -620,7 +806,7 @@ func (ui *UI) initWidgets() {
 		func() fyne.CanvasObject {
 			lbl := widget.NewLabel("")
 			rect := canvas.NewRectangle(color.Transparent)
-			return container.NewMax(rect, lbl)
+			return container.NewStack(rect, lbl)
 		},
 		ui.updateWatchTableCell,
 	)
@@ -660,47 +846,46 @@ func (ui *UI) initWidgets() {
 	}
 
 	ui.watchBtn = widget.NewButtonWithIcon(ui.t("add_to_watch"), theme.ContentAddIcon(), func() {
-        if ui.selectedNodeID != "" {
-            ui.controller.AddWatch(string(ui.selectedNodeID))
-        }
-    })
+		if ui.selectedNodeID != "" {
+			ui.controller.AddWatch(string(ui.selectedNodeID))
+		}
+	})
 
 	// 【已修正】: 清理了所有混乱的旧代码和语法错误，只保留正确的实现。
 	ui.writeBtn = widget.NewButtonWithIcon(ui.t("write_value"), theme.DocumentCreateIcon(), func() {
-        if ui.selectedNodeID == "" {
-            return
-        }
-        nid := string(ui.selectedNodeID)
-        go ui.openWriteForNode(nid)
-    })
-	
+		if ui.selectedNodeID == "" {
+			return
+		}
+		nid := string(ui.selectedNodeID)
+		go ui.openWriteForNode(nid)
+	})
+
 	ui.watchBtn.Disable()
 	ui.writeBtn.Disable()
 
 	ui.removeWatchBtn = widget.NewButtonWithIcon(ui.t("remove"), theme.DeleteIcon(), func() {
-        if ui.selectedWatchRow < 0 || ui.selectedWatchRow >= len(ui.watchRows) {
-            return
-        }
-        nodeID := ui.watchRows[ui.selectedWatchRow].NodeID
-        go ui.controller.RemoveWatch(nodeID)
-    })
+		if ui.selectedWatchRow < 0 || ui.selectedWatchRow >= len(ui.watchRows) {
+			return
+		}
+		nodeID := ui.watchRows[ui.selectedWatchRow].NodeID
+		go ui.controller.RemoveWatch(nodeID)
+	})
 	ui.selectedWatchRow = -1
 	ui.removeWatchBtn.Disable()
 
 	ui.writeWatchBtn = widget.NewButtonWithIcon(ui.t("write"), theme.DocumentCreateIcon(), func() {
-        if ui.selectedWatchRow < 0 || ui.selectedWatchRow >= len(ui.watchRows) {
-            return
-        }
-        item := ui.watchRows[ui.selectedWatchRow]
-        ui.showWriteDialog(item.NodeID, item.DataType)
-    })
+		if ui.selectedWatchRow < 0 || ui.selectedWatchRow >= len(ui.watchRows) {
+			return
+		}
+		item := ui.watchRows[ui.selectedWatchRow]
+		ui.showWriteDialog(item.NodeID, item.DataType)
+	})
 	ui.writeWatchBtn.Disable()
 
 	ui.logText = widget.NewRichText()
 	ui.logText.Wrapping = fyne.TextWrapOff
 	ui.logText.Segments = []widget.RichTextSegment{&widget.TextSegment{Text: "", Style: widget.RichTextStyleInline}}
 	ui.logScroll = container.NewScroll(ui.logText)
-	ui.logScroll.SetMinSize(fyne.NewSize(200, 150))
 }
 
 func (ui *UI) initCallbacks() {
@@ -735,6 +920,8 @@ func (ui *UI) initCallbacks() {
 
 	c.OnConnectionStateChange = func(connected bool, endpoint string, err error) {
 		fyne.Do(func() {
+			// keep internal state in sync so applyLanguage() renders correct button text
+			ui.isConnected = connected
 			ui.connectBtn.Enable()
 			if connected {
 				ui.connectBtn.SetText(ui.t("disconnect"))
@@ -790,23 +977,25 @@ func (ui *UI) initCallbacks() {
 				"Value":       attrs.Value,
 			}
 			ui.nodeInfoTable.Refresh()
+			// 属性内容可能变化，更新列宽（左列适配名称，右列适配值或占满剩余宽度）
+			ui.updateDetailsColumnWidths()
 
 			if strings.Contains(attrs.NodeClass, "Variable") {
-                // AccessLevel may be empty on some servers; treat empty as permissive
-                if attrs.AccessLevel == "" || strings.Contains(attrs.AccessLevel, "Read") {
-                    ui.watchBtn.Enable()
-                } else {
-                    ui.watchBtn.Disable()
-                }
-                if attrs.AccessLevel == "" || strings.Contains(attrs.AccessLevel, "Write") {
-                    ui.writeBtn.Enable()
-                } else {
-                    ui.writeBtn.Disable()
-                }
-            } else {
-                ui.watchBtn.Disable()
-                ui.writeBtn.Disable()
-            }
+				// AccessLevel may be empty on some servers; treat empty as permissive
+				if attrs.AccessLevel == "" || strings.Contains(attrs.AccessLevel, "Read") {
+					ui.watchBtn.Enable()
+				} else {
+					ui.watchBtn.Disable()
+				}
+				if attrs.AccessLevel == "" || strings.Contains(attrs.AccessLevel, "Write") {
+					ui.writeBtn.Enable()
+				} else {
+					ui.writeBtn.Disable()
+				}
+			} else {
+				ui.watchBtn.Disable()
+				ui.writeBtn.Disable()
+			}
 
 			ui.nodeCacheMutex.Lock()
 			ui.nodeLabelByID[attrs.NodeID] = attrs.Name
@@ -824,65 +1013,83 @@ func (ui *UI) resetNodeDetails() {
 }
 
 func (ui *UI) onConnectClicked() {
-    if ui.connectBtn.Text == ui.t("connect") {
-        endpoint := normalizeEndpoint(ui.endpointEntry.Text)
-        ui.endpointEntry.SetText(endpoint)
-        ui.config.EndpointURL = endpoint
-        ui.connectBtn.SetText(ui.t("connecting"))
-        ui.connectBtn.Disable()
-        go ui.controller.Connect(ui.config)
-    } else {
-        go ui.controller.Disconnect()
-    }
+	if ui.controller == nil {
+		return
+	}
+
+	// Check if already connected or connecting
+	if ui.isConnected {
+		ui.controller.Disconnect()
+		return
+	}
+
+	// Disable button and show connecting state
+	ui.connectBtn.Disable()
+	ui.connectBtn.SetText(ui.t("connecting"))
+	ui.connectBtn.Refresh()
+
+	go func() {
+		// Certificate handling is now done in config.ToOpcuaOptions()
+		// No need to call EnsureCertificates here as it's handled automatically
+
+		err := ui.controller.Connect(ui.config)
+		fyne.Do(func() {
+			ui.connectBtn.Enable()
+			if err != nil {
+				ui.connectBtn.SetText(ui.t("connect"))
+			}
+			ui.connectBtn.Refresh()
+		})
+	}()
 }
 
 func (ui *UI) openWriteForNode(nodeID string) {
-    // 在后台线程执行网络/读取操作，然后在 UI 线程弹窗，避免跨线程操作 UI 导致崩溃
-    go func() {
-        // 优先刷新服务器端 DataType
-        if a, err := ui.controller.ReadNodeAttributes(nodeID); err == nil && a != nil && a.DataType != "" {
-            dt := a.DataType
-            fyne.Do(func() {
-                ui.showWriteDialog(nodeID, dt)
-            })
-            return
-        }
+	// 在后台线程执行网络/读取操作，然后在 UI 线程弹窗，避免跨线程操作 UI 导致崩溃
+	go func() {
+		// 优先刷新服务器端 DataType
+		if a, err := ui.controller.ReadNodeAttributes(nodeID); err == nil && a != nil && a.DataType != "" {
+			dt := a.DataType
+			fyne.Do(func() {
+				ui.showWriteDialog(nodeID, dt)
+			})
+			return
+		}
 
-        // 回退：保留旧 meta 的最后片段
-        ui.nodeCacheMutex.RLock()
-        dataType := ""
-        if meta, ok := ui.nodeMetaByID[nodeID]; ok {
-            parts := strings.Split(meta, ",")
-            if len(parts) >= 1 {
-                dataType = strings.TrimSpace(parts[len(parts)-1])
-            }
-        }
-        ui.nodeCacheMutex.RUnlock()
+		// 回退：保留旧 meta 的最后片段
+		ui.nodeCacheMutex.RLock()
+		dataType := ""
+		if meta, ok := ui.nodeMetaByID[nodeID]; ok {
+			parts := strings.Split(meta, ",")
+			if len(parts) >= 1 {
+				dataType = strings.TrimSpace(parts[len(parts)-1])
+			}
+		}
+		ui.nodeCacheMutex.RUnlock()
 
-        dt := dataType
-        fyne.Do(func() {
-            ui.showWriteDialog(nodeID, dt)
-        })
-    }()
+		dt := dataType
+		fyne.Do(func() {
+			ui.showWriteDialog(nodeID, dt)
+		})
+	}()
 }
 
 func (ui *UI) showWriteDialog(nodeID, dataType string) {
-    valueEntry := widget.NewEntry()
-    dialog.ShowForm("Write Value to "+nodeID, "Write", "Cancel",
-        []*widget.FormItem{
-            widget.NewFormItem("Data Type", widget.NewLabel(dataType)),
-            widget.NewFormItem("New Value", valueEntry),
-        },
-        func(ok bool) {
-            if ok {
-                go ui.controller.WriteValue(nodeID, dataType, valueEntry.Text)
-            }
-        }, ui.window)
+	valueEntry := widget.NewEntry()
+	dialog.ShowForm("Write Value to "+nodeID, "Write", "Cancel",
+		[]*widget.FormItem{
+			widget.NewFormItem("Data Type", widget.NewLabel(dataType)),
+			widget.NewFormItem("New Value", valueEntry),
+		},
+		func(ok bool) {
+			if ok {
+				go ui.controller.WriteValue(nodeID, dataType, valueEntry.Text)
+			}
+		}, ui.window)
 }
 
 func (ui *UI) showConfigDialog() {
-    endpointEntry := widget.NewEntry()
-    endpointEntry.SetText(ui.config.EndpointURL)
+	endpointEntry := widget.NewEntry()
+	endpointEntry.SetText(ui.config.EndpointURL)
 
 	appURIEntry := widget.NewEntry()
 	appURIEntry.SetPlaceHolder(ui.t("placeholder_app_uri"))
@@ -908,8 +1115,23 @@ func (ui *UI) showConfigDialog() {
 	)
 	modeSelect.SetSelected(ui.config.SecurityMode)
 
-	authModeRadio := widget.NewRadioGroup([]string{"Anonymous", "Username", "Certificate"}, nil)
-	authModeRadio.SetSelected(ui.config.AuthMode)
+	// Authentication (User Identity): only Anonymous/Username in UI. Certificate belongs to security channel, not user identity.
+	valueToDisplay := map[string]string{
+		"Anonymous": ui.t("anonymous"),
+		"Username":  ui.t("username"),
+	}
+	displayToValue := map[string]string{
+		ui.t("anonymous"): "Anonymous",
+		ui.t("username"):  "Username",
+	}
+	// Start with both options; may be narrowed by endpoint discovery selection below.
+	authOptions := []string{valueToDisplay["Anonymous"], valueToDisplay["Username"]}
+	authModeRadio := widget.NewRadioGroup(authOptions, nil)
+	if disp, ok := valueToDisplay[ui.config.AuthMode]; ok {
+		authModeRadio.SetSelected(disp)
+	} else {
+		authModeRadio.SetSelected(valueToDisplay["Anonymous"]) // default
+	}
 	authModeRadio.Horizontal = true
 
 	userEntry := widget.NewEntry()
@@ -921,15 +1143,27 @@ func (ui *UI) showConfigDialog() {
 	// Remove inner labels to align entries with other form fields for maximum width
 	userPassContainer := container.NewVBox(userEntry, passwordEntry)
 
+	// Security channel certificate/key (not user identity)
 	certFileEntry := widget.NewEntry()
 	certFileEntry.SetPlaceHolder(ui.t("placeholder_cert_file"))
 	certFileEntry.SetText(ui.config.CertFile)
 	certBrowseBtn := widget.NewButton(ui.t("browse"), func() {
-		dialog.ShowFileOpen(func(reader fyne.URIReadCloser, err error) {
-			if err == nil && reader != nil {
-				certFileEntry.SetText(reader.URI().Path())
+		dlg := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
+			if err != nil || reader == nil {
+				return
+			}
+			defer reader.Close()
+			uri := reader.URI()
+			p := uri.Path()
+			if p == "" {
+				// On iOS, some providers return non-file URIs. Fallback to URI string.
+				certFileEntry.SetText(uri.String())
+			} else {
+				certFileEntry.SetText(p)
 			}
 		}, ui.window)
+		dlg.SetFilter(storage.NewExtensionFileFilter([]string{".der", ".crt", ".cer"}))
+		dlg.Show()
 	})
 	certRow := container.NewBorder(nil, nil, nil, certBrowseBtn, certFileEntry)
 
@@ -937,31 +1171,187 @@ func (ui *UI) showConfigDialog() {
 	keyFileEntry.SetPlaceHolder(ui.t("placeholder_key_file"))
 	keyFileEntry.SetText(ui.config.KeyFile)
 	keyBrowseBtn := widget.NewButton(ui.t("browse"), func() {
-		dialog.ShowFileOpen(func(reader fyne.URIReadCloser, err error) {
-			if err == nil && reader != nil {
-				keyFileEntry.SetText(reader.URI().Path())
+		dlg := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
+			if err != nil || reader == nil {
+				return
+			}
+			defer reader.Close()
+			uri := reader.URI()
+			p := uri.Path()
+			if p == "" {
+				keyFileEntry.SetText(uri.String())
+			} else {
+				keyFileEntry.SetText(p)
 			}
 		}, ui.window)
+		dlg.SetFilter(storage.NewExtensionFileFilter([]string{".key", ".pem"}))
+		dlg.Show()
 	})
 	keyRow := container.NewBorder(nil, nil, nil, keyBrowseBtn, keyFileEntry)
-	certContainerAll := container.NewVBox(certRow, keyRow)
 
-	// Holder that shows either user/pass or certificate/key
-	credHolder := container.NewVBox()
+	// Certificate generation button
+	generateCertBtn := widget.NewButton(ui.t("generate_cert"), func() {
+		// Force-generate new certificates (overwrite existing)
+		certPath, keyPath, err := cert.ForceGenerateCertificates()
+		if err != nil {
+			ui.controller.Log(fmt.Sprintf("[red]Failed to generate certificates: %v[-]", err))
+			return
+		}
+
+		// Update UI fields and live config so connections use new files immediately
+		certFileEntry.SetText(certPath)
+		keyFileEntry.SetText(keyPath)
+		ui.config.CertFile = certPath
+		ui.config.KeyFile = keyPath
+
+		// Optionally show certificate info after generation
+		if info, err := cert.GetCertificateInfo(certPath); err == nil {
+			dialog.ShowInformation(ui.t("cert_info"), info, ui.window)
+		}
+	})
+
+	// Only keep the Generate button in the actions row
+	certActionsRow := container.NewHBox(generateCertBtn)
+
+	// Declare holder early so updateSecurityFields() can reference it safely
+	var credHolder *fyne.Container
+
+	// Manage security-dependent visibility and auth options
+	updateSecurityFields := func() {
+		mode := modeSelect.Selected
+		if mode == "None" {
+			// Hide and disable certificate/key rows when not needed
+			certRow.Hide()
+			keyRow.Hide()
+			certActionsRow.Hide()
+			certFileEntry.Disable()
+			certBrowseBtn.Disable()
+			keyFileEntry.Disable()
+			keyBrowseBtn.Disable()
+			generateCertBtn.Disable()
+
+			// Show authentication selection (Anonymous only) and hide credentials when insecure
+			authModeRadio.Show()
+			credHolder.Hide()
+
+			// Force Anonymous over insecure channel
+			anonDisp := valueToDisplay["Anonymous"]
+			if len(authModeRadio.Options) != 1 || authModeRadio.Options[0] != anonDisp {
+				authModeRadio.Options = []string{anonDisp}
+			}
+			if displayToValue[authModeRadio.Selected] != "Anonymous" {
+				authModeRadio.SetSelected(anonDisp)
+			}
+		} else {
+			// Security mode is Sign or SignAndEncrypt
+			// Show authentication selection and credentials section (content toggled by radio)
+			authModeRadio.Show()
+			credHolder.Show()
+			// Ensure Username option is visible/enabled when secure
+			if len(authOptions) == 0 {
+				authOptions = []string{valueToDisplay["Anonymous"], valueToDisplay["Username"]}
+			} else {
+				// Guarantee Username is present per requirement when secure
+				hasUser := false
+				for _, o := range authOptions {
+					if o == valueToDisplay["Username"] {
+						hasUser = true
+						break
+					}
+				}
+				if !hasUser {
+					authOptions = append(authOptions, valueToDisplay["Username"]) // add Username
+				}
+			}
+			// Apply updated options to the radio group (important when switching from None)
+			authModeRadio.Options = authOptions
+			// Ensure current selection is valid
+			valid := false
+			for _, opt := range authOptions {
+				if opt == authModeRadio.Selected {
+					valid = true
+					break
+				}
+			}
+			if !valid {
+				authModeRadio.SetSelected(authOptions[0])
+			}
+
+			// If switching to Sign, prefer Username immediately
+			if mode == "Sign" {
+				userDisp := valueToDisplay["Username"]
+				// Only switch if available
+				for _, opt := range authModeRadio.Options {
+					if opt == userDisp && authModeRadio.Selected != userDisp {
+						authModeRadio.SetSelected(userDisp)
+						break
+					}
+				}
+			}
+
+			// Show cert/key for both Sign and SignAndEncrypt
+			if mode == "SignAndEncrypt" || mode == "Sign" {
+				certRow.Show()
+				keyRow.Show()
+				certActionsRow.Show()
+				certFileEntry.Enable()
+				certBrowseBtn.Enable()
+				keyFileEntry.Enable()
+				keyBrowseBtn.Enable()
+				generateCertBtn.Enable()
+			} else {
+				certRow.Hide()
+				keyRow.Hide()
+				certActionsRow.Hide()
+				certFileEntry.Disable()
+				certBrowseBtn.Disable()
+				keyFileEntry.Disable()
+				keyBrowseBtn.Disable()
+				generateCertBtn.Disable()
+			}
+		}
+		// Refresh affected rows
+		certRow.Refresh()
+		keyRow.Refresh()
+		authModeRadio.Refresh()
+		credHolder.Refresh()
+	}
+	policySelect.OnChanged = func(sel string) {
+		// If policy becomes None, enforce mode None
+		if sel == "None" && modeSelect.Selected != "None" {
+			modeSelect.SetSelected("None")
+		}
+		// If policy becomes specific (not None/Auto) while mode is None, set a secure default mode
+		if sel != "None" && sel != "Auto" && policySelect.Selected == "None" {
+			policySelect.SetSelected("Basic256Sha256")
+		}
+		updateSecurityFields()
+	}
+	modeSelect.OnChanged = func(sel string) {
+		// If mode becomes None, enforce policy None
+		if sel == "None" && policySelect.Selected != "None" {
+			policySelect.SetSelected("None")
+		}
+		// If mode becomes specific (not None/Auto) while policy is None, set a secure default policy
+		if sel != "None" && sel != "Auto" && policySelect.Selected == "None" {
+			policySelect.SetSelected("Basic256Sha256")
+		}
+		updateSecurityFields()
+	}
+	// Holder that shows either user/pass
+	credHolder = container.NewVBox()
 	setCred := func() {
-		switch authModeRadio.Selected {
+		switch displayToValue[authModeRadio.Selected] {
 		case "Anonymous":
 			credHolder.Objects = []fyne.CanvasObject{}
 		case "Username":
 			credHolder.Objects = []fyne.CanvasObject{userPassContainer}
-		case "Certificate":
-			credHolder.Objects = []fyne.CanvasObject{certContainerAll}
 		}
 		credHolder.Refresh()
 	}
 	authModeRadio.OnChanged = func(selected string) { setCred() }
-
-	// Initialize credentials area based on current auth mode
+	// initialize state once (after credHolder and setCred are ready)
+	updateSecurityFields()
 	setCred()
 
 	apiPortEntry := widget.NewEntry()
@@ -979,7 +1369,7 @@ func (ui *UI) showConfigDialog() {
 
 	langDisplayToCode := map[string]string{
 		"English": "en",
-		"中文":       "zh",
+		"中文":      "zh",
 	}
 	langNames := []string{"English", "中文"}
 	selectedLangName := "English"
@@ -993,14 +1383,174 @@ func (ui *UI) showConfigDialog() {
 	timeoutEntry.SetPlaceHolder(ui.t("placeholder_timeout_s"))
 	timeoutEntry.SetText(fmt.Sprintf("%.1f", ui.config.ConnectTimeout))
 
+	// Discover Endpoints button and logic
+	discoverBtn := widget.NewButton(ui.t("discover_endpoints"), func() {
+		// Determine timeout from field or fallback
+		to := ui.config.ConnectTimeout
+		if v, err := strconv.ParseFloat(strings.TrimSpace(timeoutEntry.Text), 64); err == nil && v > 0 {
+			to = v
+		}
+		if to <= 0 {
+			to = 10 // default 10s
+		}
+
+		// Normalize endpoint input
+		addr := normalizeEndpoint(strings.TrimSpace(endpointEntry.Text))
+		endpointEntry.SetText(addr)
+
+		prog := dialog.NewProgressInfinite(ui.t("discover_endpoints"), ui.t("discovering"), ui.window)
+		prog.Show()
+
+		// Helper mappers
+		toPolicy := func(policyURI string) string {
+			// Expect suffix after '#', e.g., ...#Basic256Sha256
+			if idx := strings.LastIndex(policyURI, "#"); idx >= 0 && idx+1 < len(policyURI) {
+				return policyURI[idx+1:]
+			}
+			// Some servers may return just the short name already
+			return policyURI
+		}
+		toMode := func(m ua.MessageSecurityMode) string {
+			switch m {
+			case ua.MessageSecurityModeNone:
+				return "None"
+			case ua.MessageSecurityModeSign:
+				return "Sign"
+			case ua.MessageSecurityModeSignAndEncrypt:
+				return "SignAndEncrypt"
+			default:
+				return "None"
+			}
+		}
+
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(to*float64(time.Second)))
+			defer cancel()
+			eps, err := opcua.GetEndpoints(ctx, addr)
+			fyne.Do(func() { prog.Hide() })
+			if err != nil {
+				fyne.Do(func() { dialog.ShowError(err, ui.window) })
+				return
+			}
+			if len(eps) == 0 {
+				fyne.Do(func() { dialog.ShowInformation(ui.t("discover_endpoints"), "No endpoints returned", ui.window) })
+				return
+			}
+
+			// Build list view
+			type row struct {
+				display          string
+				url              string
+				policy           string
+				mode             string
+				supportsAnon     bool
+				supportsUsername bool
+			}
+			rows := make([]row, 0, len(eps))
+			for _, ep := range eps {
+				pol := toPolicy(ep.SecurityPolicyURI)
+				md := toMode(ep.SecurityMode)
+				// Determine supported user token types (limit to Anonymous/UserName for UI)
+				supAnon := false
+				supUser := false
+				if ep.UserIdentityTokens != nil {
+					for _, tok := range ep.UserIdentityTokens {
+						switch tok.TokenType {
+						case ua.UserTokenTypeAnonymous:
+							supAnon = true
+						case ua.UserTokenTypeUserName:
+							supUser = true
+						}
+					}
+				}
+				// Display also mentions supported identities for clarity
+				tags := make([]string, 0, 2)
+				if supAnon {
+					tags = append(tags, valueToDisplay["Anonymous"])
+				}
+				if supUser {
+					tags = append(tags, valueToDisplay["Username"])
+				}
+				extra := ""
+				if len(tags) > 0 {
+					extra = " | " + strings.Join(tags, ", ")
+				}
+				disp := fmt.Sprintf("%s\n%s | %s%s", ep.EndpointURL, pol, md, extra)
+				rows = append(rows, row{display: disp, url: ep.EndpointURL, policy: pol, mode: md, supportsAnon: supAnon, supportsUsername: supUser})
+			}
+
+			fyne.Do(func() {
+				list := widget.NewList(
+					func() int { return len(rows) },
+					func() fyne.CanvasObject { return widget.NewLabel("") },
+					func(i widget.ListItemID, o fyne.CanvasObject) { o.(*widget.Label).SetText(rows[i].display) },
+				)
+				var picker *dialog.CustomDialog
+				list.OnSelected = func(id widget.ListItemID) {
+					if id < 0 || id >= len(rows) {
+						return
+					}
+					sel := rows[id]
+					endpointEntry.SetText(sel.url)
+					// Apply policy/mode if they are among our options
+					policySelect.SetSelected(sel.policy)
+					modeSelect.SetSelected(sel.mode)
+					// Narrow auth options based on selected endpoint
+					newOpts := make([]string, 0, 2)
+					if sel.supportsAnon {
+						newOpts = append(newOpts, valueToDisplay["Anonymous"])
+					}
+					if sel.supportsUsername {
+						newOpts = append(newOpts, valueToDisplay["Username"])
+					}
+					if len(newOpts) == 0 {
+						// fallback: keep both to let user try, default Anonymous
+						newOpts = []string{valueToDisplay["Anonymous"], valueToDisplay["Username"]}
+					}
+					authModeRadio.Options = newOpts
+					// Remember current endpoint-allowed options for restoration when security != None
+					authOptions = newOpts
+					// If current selection not available, choose first
+					cur := authModeRadio.Selected
+					found := false
+					for _, opt := range newOpts {
+						if opt == cur {
+							found = true
+							break
+						}
+					}
+					if !found {
+						authModeRadio.SetSelected(newOpts[0])
+					}
+					setCred()
+					// Update cert/key enabled state based on policy/mode after selection
+					updateSecurityFields()
+					if picker != nil {
+						picker.Hide()
+					}
+				}
+				content := container.NewVScroll(list)
+				content.SetMinSize(fyne.NewSize(480, 300))
+				picker = dialog.NewCustom(ui.t("select_endpoint"), ui.t("cancel_btn"), content, ui.window)
+				picker.Show()
+			})
+		}()
+	})
+
+	endpointRow := container.NewBorder(nil, nil, nil, discoverBtn, endpointEntry)
+
 	formItems := []*widget.FormItem{
-		widget.NewFormItem(ui.t("endpoint_url"), endpointEntry),
+		widget.NewFormItem(ui.t("endpoint_url"), endpointRow),
 		widget.NewFormItem(ui.t("application_uri"), appURIEntry),
 		widget.NewFormItem(ui.t("product_uri"), productURIEntry),
 		widget.NewFormItem(ui.t("session_timeout_s"), sessionTimeoutEntry),
 		widget.NewFormItem(ui.t("connect_timeout_s"), timeoutEntry),
 		widget.NewFormItem(ui.t("security_policy"), policySelect),
 		widget.NewFormItem(ui.t("security_mode"), modeSelect),
+		// Place certificate/key next to security settings
+		widget.NewFormItem("", certRow),
+		widget.NewFormItem("", keyRow),
+		widget.NewFormItem("", certActionsRow),
 		widget.NewFormItem(ui.t("authentication"), authModeRadio),
 		widget.NewFormItem("", credHolder),
 		widget.NewFormItem(ui.t("api_port"), apiPortEntry),
@@ -1018,7 +1568,7 @@ func (ui *UI) showConfigDialog() {
 			ui.config.ProductURI = productURIEntry.Text
 			ui.config.SecurityPolicy = policySelect.Selected
 			ui.config.SecurityMode = modeSelect.Selected
-			ui.config.AuthMode = authModeRadio.Selected
+			ui.config.AuthMode = displayToValue[authModeRadio.Selected]
 			ui.config.Username = userEntry.Text
 			ui.config.Password = passwordEntry.Text
 			ui.config.CertFile = certFileEntry.Text
@@ -1078,7 +1628,7 @@ func (ui *UI) updateWatchTableCell(id widget.TableCellID, obj fyne.CanvasObject)
 	item := ui.watchRows[index]
 
 	if index == ui.selectedWatchRow {
-		rect.FillColor = theme.FocusColor()
+		rect.FillColor = theme.Color(theme.ColorNameFocus)
 	} else {
 		rect.FillColor = color.Transparent
 	}
@@ -1127,51 +1677,51 @@ func (ui *UI) updateWatchTableCell(id widget.TableCellID, obj fyne.CanvasObject)
 }
 
 func (ui *UI) treeChildrenCallback(uid widget.TreeNodeID) []widget.TreeNodeID {
-    if uid == ui.virtualRoot {
-        // Ensure the real OPC UA root (i=84) is browsed when the virtual root is expanded,
-        // but only if we are connected.
-        if ui.controller.GetClientForExport() != nil && ui.controller.GetClientContext() != nil {
-            if !ui.controller.HasBrowseBeenPerformed("i=84") && !ui.controller.IsBrowsing("i=84") {
-                go ui.controller.Browse("i=84")
-            }
-        }
-        return ui.controller.GetAddressSpaceChildren("i=84")
-    }
-    return ui.controller.GetAddressSpaceChildren(string(uid))
+	if uid == ui.virtualRoot {
+		// Ensure the real OPC UA root (i=84) is browsed when the virtual root is expanded,
+		// but only if we are connected.
+		if ui.controller.GetClientForExport() != nil && ui.controller.GetClientContext() != nil {
+			if !ui.controller.HasBrowseBeenPerformed("i=84") && !ui.controller.IsBrowsing("i=84") {
+				go ui.controller.Browse("i=84")
+			}
+		}
+		return ui.controller.GetAddressSpaceChildren("i=84")
+	}
+	return ui.controller.GetAddressSpaceChildren(string(uid))
 }
 
 func (ui *UI) treeIsBranchCallback(uid widget.TreeNodeID) bool {
-    if uid == ui.virtualRoot {
-        return true
-    }
+	if uid == ui.virtualRoot {
+		return true
+	}
 
-    ui.nodeCacheMutex.RLock()
-    class, ok := ui.nodeClassByID[string(uid)]
-    ui.nodeCacheMutex.RUnlock()
+	ui.nodeCacheMutex.RLock()
+	class, ok := ui.nodeClassByID[string(uid)]
+	ui.nodeCacheMutex.RUnlock()
 
-    // If class is known and it's a Variable, it's not a branch
-    if ok && class == ua.NodeClassVariable {
-        return false
-    }
+	// If class is known and it's a Variable, it's not a branch
+	if ok && class == ua.NodeClassVariable {
+		return false
+	}
 
-    // Only trigger a browse when we have a connected client/context to avoid log spam pre-connect.
-    if ui.controller.GetClientForExport() != nil && ui.controller.GetClientContext() != nil {
-        if !ui.controller.HasBrowseBeenPerformed(string(uid)) && !ui.controller.IsBrowsing(string(uid)) {
-            go ui.controller.Browse(string(uid))
-        }
-    }
+	// Only trigger a browse when we have a connected client/context to avoid log spam pre-connect.
+	if ui.controller.GetClientForExport() != nil && ui.controller.GetClientContext() != nil {
+		if !ui.controller.HasBrowseBeenPerformed(string(uid)) && !ui.controller.IsBrowsing(string(uid)) {
+			go ui.controller.Browse(string(uid))
+		}
+	}
 
-    node := ui.controller.GetNode(string(uid))
-    if node != nil {
-        return node.HasChildren
-    }
-    // Unknown yet; allow expansion to feel responsive
-    return true
+	node := ui.controller.GetNode(string(uid))
+	if node != nil {
+		return node.HasChildren
+	}
+	// Unknown yet; allow expansion to feel responsive
+	return true
 }
 
 func (ui *UI) treeUpdateCallback(uid widget.TreeNodeID, isBranch bool, obj fyne.CanvasObject) {
-    tr := obj.(*treeRow)
-    tr.nodeID = uid
+	tr := obj.(*treeRow)
+	tr.nodeID = uid
 
 	ui.nodeCacheMutex.RLock()
 	if ncl, ok := ui.nodeClassByID[string(uid)]; ok {
@@ -1255,52 +1805,62 @@ func (r *treeRowRenderer) Refresh() {
 	nodeName := r.row.ui.nodeLabelByID[string(r.row.nodeID)]
 	r.row.ui.nodeCacheMutex.RUnlock()
 
-	// Highest priority: Check for special cases by ID or the reliable name.
+	// Highest priority: Check for special cases by NodeId (stable) then by name.
 	if r.row.nodeID == r.row.ui.virtualRoot {
 		// This is the absolute root of the tree, representing the connection.
 		iconResource = rootIconResource
-	} else if nodeName == "Objects" {
-		iconResource = objectsFolderIconResource
-	} else if nodeName == "Server" {
-		// This is the standard Server object under Objects.
-		iconResource = serverIconResource
-	} else if strings.Contains(strings.ToLower(nodeName), "helloworld") {
-		iconResource = specialIconResource
 	} else {
-		// Default logic based on node class and state
-		if r.row.isBranch {
-			switch r.row.nodeClass {
-			case ua.NodeClassObject:
-				if r.row.isOpen {
-					iconResource = objectIconOpenResource
-				} else {
-					iconResource = objectIconClosedResource
-				}
-			case ua.NodeClassView:
-				iconResource = viewIconResource
-			default:
-				// Fallback for other branch types (like ObjectTypes, etc.)
-				if r.row.isOpen {
-					iconResource = theme.FolderOpenIcon()
-				} else {
-					iconResource = theme.FolderIcon()
-				}
-			}
+		uidStr := string(r.row.nodeID)
+		// ObjectsFolder is ns=0;i=85
+		if uidStr == "ns=0;i=85" || (strings.HasPrefix(uidStr, "ns=0;") && strings.HasSuffix(uidStr, ";i=85")) {
+			iconResource = objectsFolderIconResource
+			// Server object is ns=0;i=2253
+		} else if uidStr == "ns=0;i=2253" || (strings.HasPrefix(uidStr, "ns=0;") && strings.HasSuffix(uidStr, ";i=2253")) {
+			iconResource = serverIconResource
+		} else if nodeName == "Objects" {
+			// Fallback on name in case some servers map different IDs
+			iconResource = objectsFolderIconResource
+		} else if nodeName == "Server" {
+			// Fallback on name if DisplayName is not localized
+			iconResource = serverIconResource
+		} else if strings.Contains(strings.ToLower(nodeName), "helloworld") {
+			iconResource = specialIconResource
 		} else {
-			// Logic for leaf nodes
-			switch r.row.nodeClass {
-			case ua.NodeClassVariable:
-				iconResource = tagIconResource
-			case ua.NodeClassMethod:
-				iconResource = methodIconResource
-			case ua.NodeClassObjectType, ua.NodeClassVariableType:
-				iconResource = objectTypeIconResource
-			case ua.NodeClassReferenceType:
-				iconResource = linkIconResource
-			case ua.NodeClassDataType:
-				iconResource = dataTypeIconResource
-			default:
-				iconResource = theme.FileIcon()
+			// Default logic based on node class and state
+			if r.row.isBranch {
+				switch r.row.nodeClass {
+				case ua.NodeClassObject:
+					if r.row.isOpen {
+						iconResource = objectIconOpenResource
+					} else {
+						iconResource = objectIconClosedResource
+					}
+				case ua.NodeClassView:
+					iconResource = viewIconResource
+				default:
+					// Fallback for other branch types (like ObjectTypes, etc.)
+					if r.row.isOpen {
+						iconResource = theme.FolderOpenIcon()
+					} else {
+						iconResource = theme.FolderIcon()
+					}
+				}
+			} else {
+				// Logic for leaf nodes
+				switch r.row.nodeClass {
+				case ua.NodeClassVariable:
+					iconResource = tagIconResource
+				case ua.NodeClassMethod:
+					iconResource = methodIconResource
+				case ua.NodeClassObjectType, ua.NodeClassVariableType:
+					iconResource = objectTypeIconResource
+				case ua.NodeClassReferenceType:
+					iconResource = linkIconResource
+				case ua.NodeClassDataType:
+					iconResource = dataTypeIconResource
+				default:
+					iconResource = theme.FileIcon()
+				}
 			}
 		}
 	}
@@ -1314,266 +1874,370 @@ func (r *treeRowRenderer) Refresh() {
 // Enable right-click (secondary tap) on tree rows for context actions
 // This implements fyne.SecondaryTappable
 func (r *treeRow) TappedSecondary(ev *fyne.PointEvent) {
-    // Do not show menu for virtual root
-    if r.nodeID == r.ui.virtualRoot {
-        return
-    }
+	// Do not show menu for virtual root
+	if r.nodeID == r.ui.virtualRoot {
+		return
+	}
 
-    // Build menu item for Add to Watch
-    addItem := fyne.NewMenuItem(r.ui.t("add_to_watch"), func() {
-        nid := string(r.nodeID)
-        go r.ui.controller.AddWatch(nid)
-    })
-    // Only enable for Variable nodes
-    if r.nodeClass != ua.NodeClassVariable {
-        addItem.Disabled = true
-    }
+	// Build menu item for Add to Watch
+	addItem := fyne.NewMenuItem(r.ui.t("add_to_watch"), func() {
+		nid := string(r.nodeID)
+		go r.ui.controller.AddWatch(nid)
+	})
+	// Only enable for Variable nodes
+	if r.nodeClass != ua.NodeClassVariable {
+		addItem.Disabled = true
+	}
 
-    m := fyne.NewMenu("", addItem)
-    // Show popup menu (default placement handled by Fyne)
-    widget.NewPopUpMenu(m, r.ui.window.Canvas())
+	m := fyne.NewMenu("", addItem)
+	// Show popup menu (default placement handled by Fyne)
+	widget.NewPopUpMenu(m, r.ui.window.Canvas())
 }
 
 // Implement primary tap to ensure selection works even if the Tree's internal handler is not reached.
 // This implements fyne.Tappable
 func (r *treeRow) Tapped(ev *fyne.PointEvent) {
-    if r == nil || r.ui == nil || r.ui.nodeTree == nil {
-        return
-    }
-    // Select the node in the tree (fires OnSelected)
-    r.ui.nodeTree.Select(r.nodeID)
-    // For branches, toggle open/close to match our UX
-    if r.isBranch {
-        r.ui.nodeTree.ToggleBranch(r.nodeID)
-    }
-    // Lightweight log for diagnostics
-    r.ui.controller.Log(fmt.Sprintf("[blue]Row Tapped: %s[-]", string(r.nodeID)))
+	if r == nil || r.ui == nil || r.ui.nodeTree == nil {
+		return
+	}
+	// Select the node in the tree (fires OnSelected)
+	r.ui.nodeTree.Select(r.nodeID)
+	// For branches, toggle open/close to match our UX
+	if r.isBranch {
+		r.ui.nodeTree.ToggleBranch(r.nodeID)
+	}
+	// Lightweight log for diagnostics
+	// r.ui.controller.Log(fmt.Sprintf("[blue]Row Tapped: %s[-]", string(r.nodeID)))
 }
 
 func (ui *UI) showExportDialog() {
-    // Format selection: JSON, CSV, Excel
-    fileTypeRadio := widget.NewRadioGroup([]string{"JSON", "CSV", "Excel"}, nil)
-    fileTypeRadio.SetSelected("JSON")
-    fileTypeRadio.Horizontal = true
+	// Format selection: JSON, CSV, Excel
+	fileTypeRadio := widget.NewRadioGroup([]string{"JSON", "CSV", "Excel"}, nil)
+	fileTypeRadio.SetSelected("JSON")
+	fileTypeRadio.Horizontal = true
 
-    // Scope selection: All or Folder
-    scopeRadio := widget.NewRadioGroup([]string{ui.t("all"), ui.t("folder")}, nil)
-    scopeRadio.SetSelected(ui.t("all"))
-    scopeRadio.Horizontal = true
+	// Scope selection: All or Folder
+	scopeRadio := widget.NewRadioGroup([]string{ui.t("all"), ui.t("folder")}, nil)
+	scopeRadio.SetSelected(ui.t("all"))
+	scopeRadio.Horizontal = true
 
-    // Folder NodeID entry (prefill with current selection if available)
-    nodeIDEntry := widget.NewEntry()
-    nodeIDEntry.SetPlaceHolder("e.g. i=85 or ns=2;s=MyFolder")
-    if ui.selectedNodeID != "" {
-        nodeIDEntry.SetText(ui.selectedNodeID)
-    }
-    nodeIDEntry.Disable()
+	// Folder NodeID entry (prefill with current selection if available)
+	nodeIDEntry := widget.NewEntry()
+	nodeIDEntry.SetPlaceHolder("e.g. i=85 or ns=2;s=MyFolder")
+	if ui.selectedNodeID != "" {
+		nodeIDEntry.SetText(ui.selectedNodeID)
+	}
+	nodeIDEntry.Disable()
 
-    // Recursive option (applies to Folder scope)
-    recursiveCheck := widget.NewCheck(ui.t("recursive"), nil)
-    recursiveCheck.Checked = true
-    recursiveCheck.Disable()
+	// Recursive option (applies to Folder scope)
+	recursiveCheck := widget.NewCheck(ui.t("recursive"), nil)
+	recursiveCheck.Checked = true
+	recursiveCheck.Disable()
 
-    // Enable/disable controls based on scope
-    scopeRadio.OnChanged = func(s string) {
-        isFolder := s == ui.t("folder")
-        if isFolder {
-            nodeIDEntry.Enable()
-            recursiveCheck.Enable()
-        } else {
-            nodeIDEntry.Disable()
-            recursiveCheck.Disable()
-        }
-    }
+	// Enable/disable controls based on scope
+	scopeRadio.OnChanged = func(s string) {
+		isFolder := s == ui.t("folder")
+		if isFolder {
+			nodeIDEntry.Enable()
+			recursiveCheck.Enable()
+		} else {
+			nodeIDEntry.Disable()
+			recursiveCheck.Disable()
+		}
+	}
 
-    d := dialog.NewForm(ui.t("export_dialog"), ui.t("export_btn"), ui.t("cancel_btn"),
-        []*widget.FormItem{
-            widget.NewFormItem(ui.t("format"), fileTypeRadio),
-            widget.NewFormItem(ui.t("scope"), scopeRadio),
-            widget.NewFormItem(ui.t("folder_nodeid"), nodeIDEntry),
-            widget.NewFormItem(ui.t("options"), recursiveCheck),
-        },
-        func(ok bool) {
-            if !ok {
-                return
-            }
-            format := fileTypeRadio.Selected
-            scope := scopeRadio.Selected
-            nodeID := strings.TrimSpace(nodeIDEntry.Text)
-            recursive := recursiveCheck.Checked
+	d := dialog.NewForm(ui.t("export_dialog"), ui.t("export_btn"), ui.t("cancel_btn"),
+		[]*widget.FormItem{
+			widget.NewFormItem(ui.t("format"), fileTypeRadio),
+			widget.NewFormItem(ui.t("scope"), scopeRadio),
+			widget.NewFormItem(ui.t("folder_nodeid"), nodeIDEntry),
+			widget.NewFormItem(ui.t("options"), recursiveCheck),
+		},
+		func(ok bool) {
+			if !ok {
+				return
+			}
+			format := fileTypeRadio.Selected
+			scope := scopeRadio.Selected
+			nodeID := strings.TrimSpace(nodeIDEntry.Text)
+			recursive := recursiveCheck.Checked
 
-            if scope == ui.t("folder") && nodeID == "" {
-                dialog.ShowError(errors.New(ui.t("folder_nodeid_error")), ui.window)
-                return
-            }
-            if scope == ui.t("all") {
-                nodeID = ""
-            }
+			if scope == ui.t("folder") && nodeID == "" {
+				dialog.ShowError(errors.New(ui.t("folder_nodeid_error")), ui.window)
+				return
+			}
+			if scope == ui.t("all") {
+				nodeID = ""
+			}
 
-            var filter storage.FileFilter
-            var extension string
-            switch format {
-            case "JSON":
-                filter = storage.NewExtensionFileFilter([]string{".json"})
-                extension = ".json"
-            case "CSV":
-                filter = storage.NewExtensionFileFilter([]string{".csv"})
-                extension = ".csv"
-            default: // Excel
-                filter = storage.NewExtensionFileFilter([]string{".xlsx"})
-                extension = ".xlsx"
-            }
+			var filter storage.FileFilter
+			var extension string
+			switch format {
+			case "JSON":
+				filter = storage.NewExtensionFileFilter([]string{".json"})
+				extension = ".json"
+			case "CSV":
+				filter = storage.NewExtensionFileFilter([]string{".csv"})
+				extension = ".csv"
+			default: // Excel
+				filter = storage.NewExtensionFileFilter([]string{".xlsx"})
+				extension = ".xlsx"
+			}
 
-            saveDialog := dialog.NewFileSave(func(writer fyne.URIWriteCloser, err error) {
-                if err != nil {
-                    dialog.ShowError(err, ui.window)
-                    return
-                }
-                if writer == nil {
-                    return
-                }
-                defer writer.Close()
+			saveDialog := dialog.NewFileSave(func(writer fyne.URIWriteCloser, err error) {
+				if err != nil {
+					dialog.ShowError(err, ui.window)
+					return
+				}
+				if writer == nil {
+					return
+				}
+				defer writer.Close()
 
-                filePath := writer.URI().Path()
-                // Normalize scope back to internal constants ("All"/"Folder")
-                scopeInternal := "All"
-                if scope == ui.t("folder") {
-                    scopeInternal = "Folder"
-                }
-                go ui.runExport(filePath, format, scopeInternal, nodeID, recursive)
+				filePath := writer.URI().Path()
+				// Normalize scope back to internal constants ("All"/"Folder")
+				scopeInternal := "All"
+				if scope == ui.t("folder") {
+					scopeInternal = "Folder"
+				}
+				go ui.runExport(filePath, format, scopeInternal, nodeID, recursive)
 
-            }, ui.window)
-            saveDialog.SetFileName("export" + extension)
-            saveDialog.SetFilter(filter)
-            saveDialog.Show()
-        }, ui.window)
-    d.Show()
+			}, ui.window)
+			saveDialog.SetFileName("export" + extension)
+			saveDialog.SetFilter(filter)
+			saveDialog.Show()
+		}, ui.window)
+	d.Show()
 }
 
 func (ui *UI) runExport(filePath, format, scope, nodeID string, recursive bool) {
-    client := ui.controller.GetClientForExport()
-    if client == nil {
-        fyne.CurrentApp().SendNotification(&fyne.Notification{
-            Title:   "Export Aborted",
-            Content: "Not connected to an OPC UA server.",
-        })
-        ui.controller.Log("[yellow]Export aborted: not connected.[-]")
-        return
-    }
+	client := ui.controller.GetClientForExport()
+	if client == nil {
+		fyne.CurrentApp().SendNotification(&fyne.Notification{
+			Title:   "Export Aborted",
+			Content: "Not connected to an OPC UA server.",
+		})
+		ui.controller.Log("[yellow]Export aborted: not connected.[-]")
+		return
+	}
 
-    // Determine root node based on scope
-    rootID := "i=84"
-    if scope == "Folder" && nodeID != "" {
-        rootID = nodeID
-    }
+	// Determine root node based on scope
+	rootID := "i=84"
+	if scope == "Folder" && nodeID != "" {
+		rootID = nodeID
+	}
 
-    // Notify start
-    ui.controller.Log(fmt.Sprintf("Starting export (%s) from %s to %s...", format, rootID, filePath))
-    fyne.CurrentApp().SendNotification(&fyne.Notification{
-        Title:   "Export Started",
-        Content: fmt.Sprintf("Building data from %s. This may take some time...", rootID),
-    })
+	// Notify start
+	ui.controller.Log(fmt.Sprintf("Starting export (%s) from %s to %s...", format, rootID, filePath))
+	fyne.CurrentApp().SendNotification(&fyne.Notification{
+		Title:   "Export Started",
+		Content: fmt.Sprintf("Building data from %s. This may take some time...", rootID),
+	})
 
-    go func() {
-        ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-        defer cancel()
-        var exportErr error
-        exporter := exporter.New(client)
-        if scope == "Folder" && !recursive {
-            // For now, non-recursive export is not implemented in exporter APIs; fall back to recursive
-            ui.controller.Log("[yellow]Non-recursive export not yet supported; exporting recursively.[-]")
-        }
-        switch format {
-        case "JSON":
-            exportErr = exporter.ExportToJSON(ctx, rootID, filePath)
-        case "CSV":
-            exportErr = exporter.ExportToCSV(ctx, rootID, filePath)
-        default: // Excel
-            exportErr = exporter.ExportToExcel(ctx, rootID, filePath)
-        }
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		var exportErr error
+		exporter := exporter.New(client)
+		if scope == "Folder" && !recursive {
+			// For now, non-recursive export is not implemented in exporter APIs; fall back to recursive
+			ui.controller.Log("[yellow]Non-recursive export not yet supported; exporting recursively.[-]")
+		}
+		switch format {
+		case "JSON":
+			exportErr = exporter.ExportToJSON(ctx, rootID, filePath)
+		case "CSV":
+			exportErr = exporter.ExportToCSV(ctx, rootID, filePath)
+		default: // Excel
+			exportErr = exporter.ExportToExcel(ctx, rootID, filePath)
+		}
 
-        if exportErr != nil {
-            fyne.CurrentApp().SendNotification(&fyne.Notification{
-                Title:   "Export Failed",
-                Content: exportErr.Error(),
-            })
-            ui.controller.Log(fmt.Sprintf("[red]Export failed: %v[-]", exportErr))
-        } else {
-            fyne.CurrentApp().SendNotification(&fyne.Notification{
-                Title:   "Export Successful",
-                Content: "Exported to " + filePath,
-            })
-            ui.controller.Log(fmt.Sprintf("[green]Successfully exported from %s to %s[-]", rootID, filePath))
-        }
-    }()
+		if exportErr != nil {
+			fyne.CurrentApp().SendNotification(&fyne.Notification{
+				Title:   "Export Failed",
+				Content: exportErr.Error(),
+			})
+			ui.controller.Log(fmt.Sprintf("[red]Export failed: %v[-]", exportErr))
+		} else {
+			fyne.CurrentApp().SendNotification(&fyne.Notification{
+				Title:   "Export Successful",
+				Content: "Exported to " + filePath,
+			})
+			ui.controller.Log(fmt.Sprintf("[green]Successfully exported from %s to %s[-]", rootID, filePath))
+		}
+	}()
 }
 
 func (ui *UI) makeLayout() fyne.CanvasObject {
-    endpointWithStatus := container.NewBorder(nil, nil, nil, ui.statusIcon, ui.endpointEntry)
-    ui.connectionCard = widget.NewCard(ui.t("endpoint"), "",
-        container.NewVBox(
-            endpointWithStatus,
-            container.NewGridWithColumns(3, ui.connectBtn, ui.configBtn, ui.exportBtn),
-            ui.apiStatusLabel,
-        ))
+	// Follow system theme automatically using a themed panel that refreshes on theme change
+	newBg := func() fyne.CanvasObject {
+		return NewThemedPanel(ui.app)
+	}
 
-    ui.addressSpaceCard = widget.NewCard(ui.t("address_space"), "", ui.nodeTree)
-    leftPanel := container.NewVSplit(ui.connectionCard, ui.addressSpaceCard)
-    leftPanel.SetOffset(0.19)
-    // Transparent split bar is not supported directly in this Fyne version; fallback to theme override.
-    _ = leftPanel
+	// Connection section with subtle gray tint and padding
+	endpointWithStatus := container.NewBorder(nil, nil, nil, ui.statusIcon,
+		container.NewPadded(ui.endpointEntry)) // Add padding around the entry
+	connBg := newBg()
 
-    ui.clearAllBtn = widget.NewButtonWithIcon(ui.t("clear_all"), theme.ContentClearIcon(), ui.controller.RemoveAllWatches)
-    watchButtons := container.NewHBox(ui.watchBtn, ui.removeWatchBtn, ui.clearAllBtn, ui.writeWatchBtn)
-    toolbarBg := canvas.NewRectangle(theme.Color(theme.ColorNameInputBackground))
-    toolbar := container.NewStack(toolbarBg, watchButtons)
-
-    // 恢复默认表格显示，避免覆盖导致内容不可见
-    watchScroll := container.NewVScroll(ui.watchTable)
-    ui.watchCard = widget.NewCard(ui.t("watch_list"), "", container.NewBorder(toolbar, nil, nil, nil, watchScroll))
-
-    scroll := container.NewVScroll(ui.nodeInfoTable)
-    scroll.SetMinSize(fyne.NewSize(0, 240))
-
-    ui.detailsCard = widget.NewCard(ui.t("selected_details"), "",
-        container.NewVBox(
-            scroll,
-        ),
-    )
-    ui.clearLogBtn = widget.NewButtonWithIcon(ui.t("clear_logs"), theme.ContentClearIcon(), ui.clearLogs)
-    ui.copyLogBtn = widget.NewButtonWithIcon(ui.t("copy"), theme.ContentCopyIcon(), ui.copyLogs)
-    ui.logTitleLbl = widget.NewLabelWithStyle(ui.t("logs"), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-
-	// 顶部标题栏（右侧：复制 + 清空）
-	rightBtns := container.NewHBox(ui.copyLogBtn, ui.clearLogBtn)
-    header := container.NewBorder(
-        nil, nil,
-        ui.logTitleLbl,
-        rightBtns,
-        layout.NewSpacer(),
-    )
-
-	logContainer := container.NewBorder(
-		header, nil, nil, nil,
-		ui.logScroll,
+	// Create a padded grid for buttons with even spacing
+	buttonGrid := container.NewPadded(
+		container.NewGridWithColumns(3,
+			container.NewHBox(layout.NewSpacer(), ui.connectBtn, layout.NewSpacer()),
+			container.NewHBox(layout.NewSpacer(), ui.configBtn, layout.NewSpacer()),
+			container.NewHBox(layout.NewSpacer(), ui.exportBtn, layout.NewSpacer()),
+		),
 	)
 
-	rightPanel := container.NewVSplit(ui.detailsCard, logContainer)
-	rightPanel.SetOffset(0.2)
-	// Transparent split bar is not supported directly in this Fyne version; fallback to theme override.
-	_ = rightPanel
+	connContent := container.NewStack(
+		connBg,
+		container.NewVBox(
+			endpointWithStatus,
+			buttonGrid, // Use the padded grid
+			ui.apiStatusLabel,
+		),
+	)
+	// Use plain container to ensure pure white background on all platforms (avoid Card gray on iOS light theme)
+	ui.connectionCard = nil
+	leftTop := connContent
 
-	centerRightPanel := container.NewHSplit(ui.watchCard, rightPanel)
+	// Address space section with the same subtle gray tint
+	addrBg := newBg()
+	addrContent := container.NewStack(addrBg, ui.nodeTree)
+	ui.addressSpaceCard = nil
+	leftBottom := addrContent
+	leftPanel := container.NewVSplit(leftTop, leftBottom)
+	// 延迟设置分割比例以确保渲染器已准备就绪
+	defer func() {
+		leftPanel.SetOffset(0.19)
+	}()
+
+	ui.clearAllBtn = widget.NewButtonWithIcon(ui.t("clear_all"), theme.ContentClearIcon(), ui.controller.RemoveAllWatches)
+
+	// Create a padded container for watch buttons with even spacing
+	watchButtons := container.NewPadded(
+		container.NewHBox(
+			layout.NewSpacer(),
+			ui.watchBtn,
+			layout.NewSpacer(),
+			ui.removeWatchBtn,
+			layout.NewSpacer(),
+			ui.clearAllBtn,
+			layout.NewSpacer(),
+			ui.writeWatchBtn,
+			layout.NewSpacer(),
+		),
+	)
+
+	toolbarBg := NewThemedArea(ui.app, func() color.Color { return theme.Color(theme.ColorNameInputBackground) }, 0, 0)
+	// Pad the toolbar so the ThemedPanel's top border remains visible and not overdrawn
+	toolbar := container.NewPadded(
+		container.NewStack(
+			toolbarBg,
+			container.NewPadded(watchButtons),
+		),
+	)
+
+	// Watch list with the same subtle gray tint
+	watchScroll := container.NewVScroll(ui.watchTable)
+	watchBg := newBg()
+	watchContent := container.NewStack(
+		watchBg,
+		container.NewBorder(toolbar, nil, nil, nil,
+			container.NewPadded(watchScroll), // Add padding around the watch list
+		),
+	)
+	// No Card for watch list; keep pure container for white background
+	ui.watchCard = nil
+
+	// 创建一个自适应宽度的滚动容器，并设置一个合理的最小高度，避免被压扁
+	scroll := container.NewVScroll(ui.nodeInfoTable)
+	scroll.SetMinSize(fyne.NewSize(0, 240))
+
+	// Details 区域与日志区域结构对齐：背景 + 顶部标题 + 内边距 + 内容
+	detailsBg := newBg()
+	ui.detailsTitleLbl = widget.NewLabelWithStyle(ui.t("selected_details"), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	detailsHeader := container.NewBorder(
+		nil, nil,
+		ui.detailsTitleLbl,
+		nil,
+		layout.NewSpacer(),
+	)
+	detailsContainer := container.NewStack(
+		detailsBg,
+		container.NewPadded(
+			container.NewBorder(
+				detailsHeader,
+				nil, nil, nil,
+				scroll,
+			),
+		),
+	)
+	// No Card for details; keep pure container for white background
+	ui.detailsCard = nil
+
+	ui.clearLogBtn = widget.NewButtonWithIcon(ui.t("clear_logs"), theme.ContentClearIcon(), ui.clearLogs)
+	ui.copyLogBtn = widget.NewButtonWithIcon(ui.t("copy"), theme.ContentCopyIcon(), ui.copyLogs)
+	ui.logTitleLbl = widget.NewLabelWithStyle(ui.t("logs"), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+
+	// 顶部标题栏（右侧：复制 + 清空），添加内边距和按钮间距
+	rightBtns := container.NewHBox(
+		layout.NewSpacer(),
+		ui.copyLogBtn,
+		layout.NewSpacer(),
+		ui.clearLogBtn,
+		layout.NewSpacer(),
+	)
+	header := container.NewBorder(
+		nil, nil,
+		ui.logTitleLbl,
+		rightBtns,
+		layout.NewSpacer(),
+	)
+	// Logs with the same subtle gray tint
+	logBg := newBg()
+	// 日志容器使用相同的布局结构保持对齐
+	// 简化日志容器构建
+	logContainer := container.NewStack(
+		logBg,
+		container.NewPadded(
+			container.NewBorder(
+				header, // 顶部放置标题和按钮
+				nil, nil, nil,
+				ui.logScroll,
+			),
+		),
+	)
+
+	// 取消使用 Card，直接使用容器以获得纯白背景
+
+	// 右侧上下采用可调分割：上（属性）/ 下（日志）- 使用纯容器，避免 Card 的灰背景
+	rightPanel := container.NewVSplit(detailsContainer, logContainer)
+	rightPanel.SetOffset(0.35)
+
+	// 创建监视列表和右侧面板的水平分割
+	centerRightPanel := container.NewHSplit(watchContent, rightPanel)
+	// 设置默认分割比例，避免初次渲染错位
 	centerRightPanel.SetOffset(0.6)
-	// Transparent split bar is not supported directly in this Fyne version; fallback to theme override.
-	_ = centerRightPanel
 
 	mainLayout := container.NewHSplit(leftPanel, centerRightPanel)
+	// 设置主分割比例
 	mainLayout.SetOffset(0.3)
-	// Transparent split bar is not supported directly in this Fyne version; fallback to theme override.
-	_ = mainLayout
 
-	return container.NewMax(mainLayout)
+	// 顶部品牌栏（iOS 上无窗口标题，这里展示应用名与作者）- 无单独背景
+	brandLabel := widget.NewLabelWithStyle(" 😃 Big GiantBaby 🍀", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true})
+	brand := container.NewPadded(
+		container.NewHBox(
+			layout.NewSpacer(),
+			brandLabel,
+		),
+	)
+	// 通过 Padded 容器提供的上下内边距保证足够高度
+
+	// 用 Border 将品牌栏置于顶部
+	wrapped := container.NewBorder(brand, nil, nil, nil, mainLayout)
+	// Outermost background: themed, borderless, follows system theme
+	rootBg := NewThemedBackground(ui.app)
+	return container.NewStack(rootBg, wrapped)
 }
 
 func (ui *UI) copyLogs() {
@@ -1582,7 +2246,7 @@ func (ui *UI) copyLogs() {
 	ui.logMutex.Unlock()
 	// 去掉颜色标记 [color] 和 [-]
 	clean := regexp.MustCompile(`\[[a-zA-Z]+\]|\[-\]`).ReplaceAllString(text, "")
-	ui.window.Clipboard().SetContent(clean)
+	ui.app.Clipboard().SetContent(clean)
 }
 
 func (ui *UI) clearLogs() {
@@ -1618,58 +2282,73 @@ func normalizeEndpoint(input string) string {
 	return "opc.tcp://" + s + ":4840"
 }
 
-type compactTheme struct{}
+// updateDetailsColumnWidths 根据属性名称文本宽度自适应设置左列宽度
+func (ui *UI) updateDetailsColumnWidths() {
+	if ui == nil || ui.nodeInfoTable == nil || len(ui.nodeInfoKeys) == 0 {
+		return
+	}
+	// 1) Left column width by longest key
+	var leftW float32
+	for _, key := range ui.nodeInfoKeys {
+		lbl := widget.NewLabel(key)
+		lbl.TextStyle = fyne.TextStyle{Bold: true}
+		sz := lbl.MinSize()
+		if sz.Width > leftW {
+			leftW = sz.Width
+		}
+	}
+	padding := float32(theme.Padding()) * 2
+	extra := float32(12)
+	leftW = leftW + padding + extra
+	ui.nodeInfoTable.SetColumnWidth(0, leftW)
 
-func (t *compactTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
-	// 更柔和的背景
-	if name == theme.ColorNameBackground && variant == theme.VariantLight {
-		return color.NRGBA{R: 245, G: 247, B: 250, A: 255}
+	// 2) Right column width by content or remaining width, whichever is larger
+	var maxValW float32
+	for _, key := range ui.nodeInfoKeys {
+		val := ui.nodeInfoData[key]
+		lbl := widget.NewLabel(val)
+		// measure unwrapped to estimate full width needed (table may scroll horizontally)
+		lbl.Wrapping = fyne.TextWrapOff
+		sz := lbl.MinSize()
+		if sz.Width > maxValW {
+			maxValW = sz.Width
+		}
 	}
-	// 禁用态更浅
-	if name == theme.ColorNameDisabled {
-		return color.NRGBA{R: 150, G: 150, B: 150, A: 255}
-	}
-	// 分割条尽量透明
-	if name == theme.ColorNameSeparator {
-		return color.NRGBA{R: 0, G: 0, B: 0, A: 0}
-	}
-	// 阴影去掉，避免分隔条显得厚重
-	if name == theme.ColorNameShadow {
-		return color.NRGBA{R: 0, G: 0, B: 0, A: 0}
-	}
-	return theme.DefaultTheme().Color(name, variant)
-}
-
-func (t *compactTheme) Font(style fyne.TextStyle) fyne.Resource {
-	return theme.DefaultTheme().Font(style)
-}
-func (t *compactTheme) Icon(name fyne.ThemeIconName) fyne.Resource {
-	return theme.DefaultTheme().Icon(name)
-}
-func (t *compactTheme) Size(name fyne.ThemeSizeName) float32 {
-	switch name {
-	case theme.SizeNamePadding:
-		return 4
-	case theme.SizeNameText:
-		return 12
-	case theme.SizeNameInlineIcon:
-		return 14
-	case theme.SizeNameHeadingText: // 标题文字
-		return 14
-	default:
-		return theme.DefaultTheme().Size(name)
+	desiredRight := maxValW + padding + extra
+	tableW := ui.nodeInfoTable.Size().Width
+	if tableW > 0 {
+		remaining := tableW - leftW - padding
+		if remaining < desiredRight {
+			ui.nodeInfoTable.SetColumnWidth(1, desiredRight)
+		} else {
+			ui.nodeInfoTable.SetColumnWidth(1, remaining)
+		}
+	} else {
+		ui.nodeInfoTable.SetColumnWidth(1, desiredRight)
 	}
 }
 
 const configName = "opcuababy_config.json"
 
 func (ui *UI) saveConfig() {
+	// 1) Save to Preferences (works on iOS/iPadOS)
+	if ui.app != nil {
+		if data, err := json.Marshal(ui.config); err == nil {
+			ui.app.Preferences().SetString("config_json", string(data))
+		} else {
+			ui.controller.Log(fmt.Sprintf("Failed to marshal config for preferences: %v", err))
+		}
+	}
+
+	// 2) On non-iOS platforms, additionally write a JSON file next to the executable for backward compatibility
+	if runtime.GOOS == "ios" {
+		return
+	}
 	data, err := json.MarshalIndent(ui.config, "", "  ")
 	if err != nil {
 		ui.controller.Log(fmt.Sprintf("Failed to marshal config: %v", err))
 		return
 	}
-
 	exePath, err := os.Executable()
 	if err != nil {
 		ui.controller.Log(fmt.Sprintf("Failed to get executable path: %v", err))
@@ -1677,32 +2356,38 @@ func (ui *UI) saveConfig() {
 	}
 	exeDir := filepath.Dir(exePath)
 	configFilePath := filepath.Join(exeDir, configName)
-
-	err = os.WriteFile(configFilePath, data, 0644)
-	if err != nil {
+	if err := os.WriteFile(configFilePath, data, 0644); err != nil {
 		ui.controller.Log(fmt.Sprintf("Failed to write config file: %v", err))
 		return
 	}
 }
 
 func (ui *UI) loadConfig() {
+	// 1) Try Preferences first (especially for iOS)
+	if ui.app != nil {
+		if s := ui.app.Preferences().StringWithFallback("config_json", ""); s != "" {
+			if err := json.Unmarshal([]byte(s), ui.config); err != nil {
+				ui.controller.Log(fmt.Sprintf("Failed to unmarshal preferences config: %v", err))
+			}
+			return
+		}
+	}
+
+	// 2) Fallback: read file next to the executable (desktop platforms)
 	exePath, err := os.Executable()
 	if err != nil {
 		ui.controller.Log(fmt.Sprintf("Failed to get executable path: %v", err))
-		ui.saveConfig() // 兜底保存默认配置到默认保存机制
+		ui.saveConfig() // save defaults to preferences (and file if supported)
 		return
 	}
 	exeDir := filepath.Dir(exePath)
 	configFilePath := filepath.Join(exeDir, configName)
-
 	data, err := os.ReadFile(configFilePath)
 	if err != nil {
 		ui.saveConfig()
 		return
 	}
-
-	err = json.Unmarshal(data, ui.config)
-	if err != nil {
+	if err := json.Unmarshal(data, ui.config); err != nil {
 		ui.controller.Log(fmt.Sprintf("Failed to unmarshal config: %v", err))
 	}
 }

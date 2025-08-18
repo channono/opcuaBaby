@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Flat Abstract Baby Face Icon</title>
+  <desc>Simple, flat, abstract baby face in cold bright blue. Transparent background.</desc>
+  <defs></defs>
+
+  <!-- Baby face drawn directly using even-odd fill (no mask/clip) -->
+  <g transform="translate(512 512)">
+    <path fill="#1EA7FF" fill-rule="evenodd" d="
+      M 360 0
+      A 360 360 0 1 0 -360 0
+      A 360 360 0 1 0 360 0
+
+      M -110 -40
+      A 54 54 0 1 0 -110 68
+      A 54 54 0 1 0 -110 -40
+
+      M 110 -40
+      A 54 54 0 1 0 110 68
+      A 54 54 0 1 0 110 -40
+
+      M -220 100
+      Q 0 260 220 100
+      Q 0 180 -220 100 Z
+
+      M -10 -210
+      Q 40 -250 80 -210
+      Q 30 -230 -10 -190 Z
+    "/>
+  </g>
+</svg>

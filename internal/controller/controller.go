@@ -3,57 +3,31 @@
 package controller
 
 import (
+    "crypto/rsa"
+    "crypto/sha1"
+    "crypto/x509"
 	"context"
 	"encoding/hex"
+    "encoding/pem"
 	"errors"
 	"fmt"
-	"reflect"
 	"net/http"
 	"opcuababy/internal/opc"
+	"github.com/gopcua/opcua"
+	"github.com/gopcua/opcua/ua"
+    "os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 
 	"sync"
 	"time"
-	"github.com/gopcua/opcua/ua"
 )
 
 // startWatchUpdatePump periodically emits the entire watch list to the UI callback,
 // reducing UI refresh frequency under heavy data change load.
-func (c *Controller) startWatchUpdatePump() {
-    c.mu.RLock()
-    ctx := c.clientCtx
-    c.mu.RUnlock()
-    if ctx == nil {
-        return
-    }
-    ticker := time.NewTicker(33 * time.Millisecond)
-    go func() {
-        defer ticker.Stop()
-        for {
-            select {
-            case <-ctx.Done():
-                return
-            case <-ticker.C:
-                c.mu.RLock()
-                if !c.isConnected || c.OnWatchListUpdate == nil {
-                    c.mu.RUnlock()
-                    continue
-                }
-                items := make([]*WatchItem, 0, len(c.watchItems))
-                for _, wi := range c.watchItems {
-                    items = append(items, wi)
-                }
-                sort.Slice(items, func(i, j int) bool { return items[i].NodeID < items[j].NodeID })
-                cb := c.OnWatchListUpdate
-                c.mu.RUnlock()
-                // Emit outside lock
-                cb(items)
-            }
-        }
-    }()
-}
+// (removed) startWatchUpdatePump was unused after simplifying connection logic
 // NodeManager defines the interface for API server interactions, breaking import cycles.
 type NodeManager interface {
 	ReadNodeAttributes(nodeID string) (*NodeAttributes, error)
@@ -135,8 +109,6 @@ type Controller struct {
 	noChildrenCached map[string]bool // 日志限流用
 
 	logMu          sync.Mutex
-	logCount       int
-	logWindowStart time.Time
 
 	// API Server fields
 	apiServer       *http.Server
@@ -214,85 +186,289 @@ func (c *Controller) Connect(cfg *opc.Config) error {
     c.clientCancel = cancel
     c.clientLifecycleMutex.Unlock()
 
-    // Create opc client
-    // Up to 3 attempts
-    const attempts = 3
-    var lastErr error
-    for i := 1; i <= attempts; i++ {
-        cli, err := opc.NewClient(cfg.EndpointURL)
-        if err != nil {
-            lastErr = err
-            c.Log(fmt.Sprintf("[red]Connect attempt %d/%d: failed to create client: %v[-]", i, attempts, err))
-            if i < attempts {
-                time.Sleep(1 * time.Second)
-                continue
+    // Prefer selecting the exact endpoint that offers None/None. If Anonymous is disabled, use Username when available.
+    var opts []opcua.Option
+    connectURL := cfg.EndpointURL
+    if eps, err := opcua.GetEndpoints(ctx, cfg.EndpointURL); err == nil {
+        var epNone *ua.EndpointDescription
+        var epSign *ua.EndpointDescription
+        var epSignEnc *ua.EndpointDescription
+        // Collect preferred endpoints once
+        for _, ep := range eps {
+            if ep == nil { continue }
+            if ep.SecurityPolicyURI == ua.SecurityPolicyURINone && ep.SecurityMode == ua.MessageSecurityModeNone && epNone == nil {
+                epNone = ep
             }
-            break
+            if ep.SecurityPolicyURI == ua.SecurityPolicyURIBasic256Sha256 && ep.SecurityMode == ua.MessageSecurityModeSign && epSign == nil {
+                epSign = ep
+            }
+            if ep.SecurityPolicyURI == ua.SecurityPolicyURIBasic256Sha256 && ep.SecurityMode == ua.MessageSecurityModeSignAndEncrypt && epSignEnc == nil {
+                epSignEnc = ep
+            }
         }
-        // Set data change handler and connect
-        cli.Handler = c
-        // Apply connect timeout if configured
-        connectCtx := ctx
-        var tCancel context.CancelFunc
-        if cfg.ConnectTimeout > 0 {
-            d := time.Duration(cfg.ConnectTimeout*1000) * time.Millisecond
-            connectCtx, tCancel = context.WithTimeout(ctx, d)
+        // Helper to extract first Username policyID
+        getUserPolicyID := func(ep *ua.EndpointDescription) (pid string, hasUser bool, hasAnon bool) {
+            if ep == nil { return "", false, false }
+            for _, tp := range ep.UserIdentityTokens {
+                if tp == nil { continue }
+                if tp.TokenType == ua.UserTokenTypeUserName && pid == "" { pid, hasUser = tp.PolicyID, true }
+                if tp.TokenType == ua.UserTokenTypeAnonymous { hasAnon = true }
+            }
+            return
         }
-        err = cli.Connect(connectCtx)
-        if tCancel != nil {
-            tCancel()
-        }
-        if err != nil {
-            lastErr = err
-            // Detect timeout: context deadline or errors implementing Timeout() bool
-            isTimeout := errors.Is(err, context.DeadlineExceeded)
-            if !isTimeout {
-                if te, ok := any(err).(interface{ Timeout() bool }); ok && te.Timeout() {
-                    isTimeout = true
+
+        // Try Anonymous first if allowed on None/None (only when cfg.AuthMode is not explicitly Username)
+        if epNone != nil {
+            if _, _, hasAnon := getUserPolicyID(epNone); hasAnon {
+                // If user explicitly requests Username via config, skip anonymous
+                useAnon := true
+                if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.AuthMode), "username") {
+                    useAnon = false
+                }
+                if useAnon {
+                    opts = []opcua.Option{
+                        opcua.SecurityFromEndpoint(epNone, ua.UserTokenTypeAnonymous),
+                        opcua.AuthAnonymous(),
+                        opcua.ApplicationName("opcuababy"),
+                    }
+                    // Use the endpoint's advertised URL to avoid server-side mismatch
+                    if epNone.EndpointURL != "" { connectURL = epNone.EndpointURL }
                 }
             }
-            if isTimeout {
-                c.Log(fmt.Sprintf("[red]Connect attempt %d/%d timeout after %.1fs to %s[-]", i, attempts, cfg.ConnectTimeout, cfg.EndpointURL))
-            } else {
-                c.Log(fmt.Sprintf("[red]Connect attempt %d/%d failed: %v[-]", i, attempts, err))
-            }
-            // Best effort disconnect if Connect partially established
-            _ = cli.Disconnect(context.Background())
-            if i < attempts {
-                c.Log("[yellow]Retrying connect...[-]")
-                time.Sleep(1 * time.Second)
-                continue
-            }
-            break
         }
-        // Success
+
+        // If Anonymous not available or not desired, and Username provided, attempt Username across modes in order
+        if len(opts) == 0 {
+            if cfg.Username == "" {
+                // Will fall back later if no username; otherwise we'll build Username attempts
+            } else {
+                // Build a list of username-capable endpoints. If cfg specifies a policy/mode, target only that.
+                type candidate struct { ep *ua.EndpointDescription; pid string; tok ua.UserTokenType }
+                cands := make([]candidate, 0, 3)
+                if epNone != nil {
+                    if pid, hasUser, _ := getUserPolicyID(epNone); hasUser {
+                        cands = append(cands, candidate{ep: epNone, pid: pid, tok: ua.UserTokenTypeUserName})
+                    }
+                }
+                if epSign != nil {
+                    if pid, hasUser, _ := getUserPolicyID(epSign); hasUser {
+                        cands = append(cands, candidate{ep: epSign, pid: pid, tok: ua.UserTokenTypeUserName})
+                    }
+                }
+                if epSignEnc != nil {
+                    if pid, hasUser, _ := getUserPolicyID(epSignEnc); hasUser {
+                        cands = append(cands, candidate{ep: epSignEnc, pid: pid, tok: ua.UserTokenTypeUserName})
+                    }
+                }
+
+                // Apply cfg.SecurityPolicy/Mode filter if provided
+                if cfg != nil {
+                    wantPol := strings.ToLower(strings.TrimSpace(cfg.SecurityPolicy))
+                    wantMode := strings.ToLower(strings.TrimSpace(cfg.SecurityMode))
+                    if wantPol != "" || wantMode != "" {
+                        filtered := make([]candidate, 0, len(cands))
+                        for _, cand := range cands {
+                            pol := strings.ToLower(cand.ep.SecurityPolicyURI)
+                            mode := strings.ToLower(cand.ep.SecurityMode.String())
+                            matchPol := wantPol == "" || strings.Contains(pol, wantPol)
+                            matchMode := wantMode == "" || strings.EqualFold(mode, wantMode)
+                            if matchPol && matchMode {
+                                filtered = append(filtered, cand)
+                            }
+                        }
+                        if len(filtered) > 0 { cands = filtered }
+                    }
+                }
+
+                // Prepare certificate/private key once if any secure endpoints will be attempted
+                var rsaKey *rsa.PrivateKey
+                var certDER []byte
+                var extraIdentOpts []opcua.Option
+                needSecure := false
+                for _, cand := range cands { if cand.ep.SecurityMode != ua.MessageSecurityModeNone { needSecure = true; break } }
+                if needSecure {
+                    if cfg == nil || cfg.CertFile == "" || cfg.KeyFile == "" {
+                        c.Log("[red]Secure endpoints available but CertFile/KeyFile not configured; they will be skipped[-]")
+                    } else {
+                        // Read and parse private key (PEM or DER; PKCS#1 or PKCS#8)
+                        if keyBytes, err := os.ReadFile(cfg.KeyFile); err == nil {
+                            var keyDER []byte
+                            if b, _ := pem.Decode(keyBytes); b != nil {
+                                if x509.IsEncryptedPEMBlock(b) || len(b.Headers) > 0 {
+                                    c.Log("[red]Encrypted private key not supported; skipping secure endpoints[-]")
+                                } else {
+                                    keyDER = b.Bytes
+                                }
+                            } else {
+                                keyDER = keyBytes
+                            }
+                            if keyDER != nil {
+                                if k1, e1 := x509.ParsePKCS1PrivateKey(keyDER); e1 == nil {
+                                    rsaKey = k1
+                                } else if kIf, e2 := x509.ParsePKCS8PrivateKey(keyDER); e2 == nil {
+                                    if rk, ok := kIf.(*rsa.PrivateKey); ok { rsaKey = rk } else { c.Log("[red]Private key is not RSA; skipping secure endpoints[-]") }
+                                } else {
+                                    c.Log("[red]Failed to parse private key; skipping secure endpoints[-]")
+                                }
+                            }
+                        } else {
+                            c.Log("[red]Failed to read key file; skipping secure endpoints[-]")
+                        }
+
+                        // Read and parse certificate (PEM chain or DER single)
+                        if certBytes, err := os.ReadFile(cfg.CertFile); err == nil {
+                            if strings.Contains(string(certBytes), "-----BEGIN") {
+                                // pick first CERTIFICATE block
+                                rest := certBytes
+                                for {
+                                    var block *pem.Block
+                                    block, rest = pem.Decode(rest)
+                                    if block == nil { break }
+                                    if block.Type == "CERTIFICATE" {
+                                        certDER = block.Bytes
+                                        break
+                                    }
+                                }
+                                if certDER == nil { c.Log("[red]No CERTIFICATE block found in PEM; skipping secure endpoints[-]") }
+                            } else {
+                                // assume DER
+                                if _, e := x509.ParseCertificate(certBytes); e == nil {
+                                    certDER = certBytes
+                                } else {
+                                    c.Log("[red]Failed to parse certificate (DER); skipping secure endpoints[-]")
+                                }
+                            }
+                            if certDER != nil {
+                                if pc, e := x509.ParseCertificate(certDER); e == nil {
+                                    // Log thumbprint to help server-side trust
+                                    fp := sha1.Sum(certDER)
+                                    c.Log(fmt.Sprintf("[cyan]Client cert SHA1: %s[-]", strings.ToUpper(hex.EncodeToString(fp[:]))))
+                                    // Use ApplicationURI from cert if present to match server validation
+                                    if len(pc.URIs) > 0 && pc.URIs[0] != nil {
+                                        extraIdentOpts = append(extraIdentOpts, opcua.ApplicationURI(pc.URIs[0].String()))
+                                    }
+                                }
+                            }
+                        } else {
+                            c.Log("[red]Failed to read certificate file; skipping secure endpoints[-]")
+                        }
+                    }
+                }
+
+                // Try each candidate until one connects
+                var lastErr error
+                attempted := 0
+                for i, cand := range cands {
+                    tryOpts := []opcua.Option{
+                        opcua.SecurityFromEndpoint(cand.ep, cand.tok),
+                        opcua.AuthUsername(cfg.Username, cfg.Password),
+                    }
+                    if cand.pid != "" { tryOpts = append(tryOpts, opcua.AuthPolicyID(cand.pid)) }
+                    // Ensure consistent identity (ApplicationURI/ApplicationName)
+                    if len(extraIdentOpts) > 0 { tryOpts = append(tryOpts, extraIdentOpts...) }
+                    tryOpts = append(tryOpts, opcua.ApplicationName("opcuababy"))
+
+                    // If connecting to a secure endpoint (Sign/SignAndEncrypt), ensure certificate/key are provided.
+                    if cand.ep.SecurityMode != ua.MessageSecurityModeNone {
+                        if cfg == nil || cfg.CertFile == "" || cfg.KeyFile == "" || rsaKey == nil || certDER == nil {
+                            // skip this candidate with a clear log
+                            c.Log("[red]Skipping secure endpoint: certificate/key not configured in cfg[-]")
+                            continue
+                        }
+                        // Append certificate and private key for secure channel
+                        tryOpts = append(tryOpts, opcua.PrivateKey(rsaKey), opcua.Certificate(certDER))
+                    }
+
+                    // Attempt connect using a temporary client to the endpoint's own URL
+                    targetURL := cfg.EndpointURL
+                    if cand.ep != nil && cand.ep.EndpointURL != "" { targetURL = cand.ep.EndpointURL }
+                    attempted++
+                    c.Log(fmt.Sprintf("[yellow]Trying Username endpoint: %s / %s @ %s[-]", cand.ep.SecurityPolicyURI, cand.ep.SecurityMode.String(), targetURL))
+                    tmpCli, cerr := opc.NewClient(targetURL, tryOpts...)
+                    if cerr != nil {
+                        lastErr = cerr
+                        c.Log(fmt.Sprintf("[red]Create client failed for %s / %s: %v[-]", cand.ep.SecurityPolicyURI, cand.ep.SecurityMode.String(), cerr))
+                        if i == len(cands)-1 { continue }
+                        continue
+                    }
+                    if err := tmpCli.Connect(ctx); err != nil {
+                        lastErr = err
+                        c.Log(fmt.Sprintf("[red]Connect failed for %s / %s: %v[-]", cand.ep.SecurityPolicyURI, cand.ep.SecurityMode.String(), err))
+                        _ = tmpCli.Disconnect(context.Background())
+                        if i == len(cands)-1 { continue }
+                        continue
+                    }
+                    // Success: assign as controller client and finalize state
+                    c.mu.Lock()
+                    c.client = tmpCli
+                    c.isConnected = true
+                    c.isConnecting = false
+                    c.mu.Unlock()
+                    tmpCli.Handler = c
+                    c.Log(fmt.Sprintf("[green]Connected to %s (Username, %s/%s)[-]", cfg.EndpointURL, cand.ep.SecurityPolicyURI, cand.ep.SecurityMode.String()))
+                    if c.OnConnectionStateChange != nil { c.OnConnectionStateChange(true, cfg.EndpointURL, nil) }
+                    return nil
+                }
+                if attempted > 0 {
+                    // We attempted secure/username endpoints; do not fall back to None which server may reject.
+                    c.mu.Lock()
+                    c.isConnecting = false
+                    c.mu.Unlock()
+                    if lastErr == nil { lastErr = fmt.Errorf("all secure Username candidates failed without detailed error") }
+                    if c.OnConnectionStateChange != nil { c.OnConnectionStateChange(false, cfg.EndpointURL, lastErr) }
+                    return lastErr
+                }
+            }
+        }
+    }
+    // Fallback if discovery failed or no matching endpoint found: keep previous explicit None/None with Anonymous
+    if len(opts) == 0 {
+        opts = []opcua.Option{
+            opcua.SecurityMode(ua.MessageSecurityModeNone),
+            opcua.SecurityPolicy(ua.SecurityPolicyURINone),
+            opcua.AuthAnonymous(),
+        }
+    }
+
+    // Create client (Anonymous path or fallback)
+    cli, err := opc.NewClient(connectURL, opts...)
+    if err != nil {
         c.mu.Lock()
-        c.client = cli
-        c.isConnected = true
         c.isConnecting = false
         c.mu.Unlock()
-        c.Log(fmt.Sprintf("[green]Connected to %s[-]", cfg.EndpointURL))
+        c.Log(fmt.Sprintf("[red]Create client failed: %v[-]", err))
         if c.OnConnectionStateChange != nil {
-            c.OnConnectionStateChange(true, cfg.EndpointURL, nil)
+            c.OnConnectionStateChange(false, cfg.EndpointURL, err)
         }
-        // Start throttled watch list update pump
-        c.startWatchUpdatePump()
-        // Kick initial browse of RootFolder if available
-        go c.Browse("i=84")
-        return nil
+        return err
     }
-    // Final failure
+
+    // Set data change handler and connect
+    cli.Handler = c
+    if err := cli.Connect(ctx); err != nil {
+        _ = cli.Disconnect(context.Background())
+        c.mu.Lock()
+        c.isConnecting = false
+        c.mu.Unlock()
+        c.Log(fmt.Sprintf("[red]Connect failed: %v[-]", err))
+        if c.OnConnectionStateChange != nil {
+            c.OnConnectionStateChange(false, cfg.EndpointURL, err)
+        }
+        return err
+    }
+
+    // Success
     c.mu.Lock()
+    c.client = cli
+    c.isConnected = true
     c.isConnecting = false
     c.mu.Unlock()
-    if lastErr == nil {
-        lastErr = fmt.Errorf("connect failed")
-    }
-    c.Log(fmt.Sprintf("[red]Connect failed after %d attempts: %v[-]", attempts, lastErr))
+    c.Log(fmt.Sprintf("[green]Connected to %s[-]", cfg.EndpointURL))
     if c.OnConnectionStateChange != nil {
-        c.OnConnectionStateChange(false, cfg.EndpointURL, lastErr)
+        c.OnConnectionStateChange(true, cfg.EndpointURL, nil)
     }
-    return lastErr
+    // Minimal: no extra background flows here
+    return nil
 }
 
 func (c *Controller) Disconnect() {
@@ -507,18 +683,14 @@ func (c *Controller) CollectVariableNodes(parentID string, recursive bool) ([]*E
         return nil, fmt.Errorf("not connected")
     }
 
-    // Determine start IDs
-    startIDs := []string{}
-    if parentID == "" {
-        startIDs = []string{"i=84"} // RootFolder
-    } else {
-        startIDs = []string{parentID}
-    }
-
     // Iterative BFS to avoid deep recursion and leaks
     queue := make([]string, 0, 64)
     visited := make(map[string]bool)
-    queue = append(queue, startIDs...)
+    if parentID == "" {
+        queue = append(queue, "i=84") // RootFolder
+    } else {
+        queue = append(queue, parentID)
+    }
 
     tags := make([]*ExportTag, 0, 256)
     deadline := time.After(30 * time.Second) // safeguard
@@ -718,22 +890,23 @@ func (c *Controller) HandleDataChange(nodeID string, dv *ua.DataValue) {
         item.Value = "<error: no data>"
         item.Timestamp = time.Now().Format("15:04:05.000")
         item.Severity = "Bad"
-        // fall-through to notify UI below
-    }
-    if dv.Value != nil {
-        item.Value = formatValue(dv.Value, item.DataType)
+        // do not access dv fields when dv is nil
     } else {
-        item.Value = "<nil>"
+        if dv.Value != nil {
+            item.Value = formatValue(dv.Value, item.DataType)
+        } else {
+            item.Value = "<nil>"
+        }
+        item.Timestamp = time.Now().Format("15:04:05.000")
+        sev, symName, subCode, structChanged, semChanged, infoBits, rawCode := decodeStatusCode(dv.Status)
+        item.Severity = sev
+        item.SymbolicName = symName
+        item.SubCode = subCode
+        item.StructureChanged = structChanged
+        item.SemanticsChanged = semChanged
+        item.InfoBits = infoBits
+        item.RawCode = rawCode
     }
-    item.Timestamp = time.Now().Format("15:04:05.000")
-    sev, symName, subCode, structChanged, semChanged, infoBits, rawCode := decodeStatusCode(dv.Status)
-    item.Severity = sev
-    item.SymbolicName = symName
-    item.SubCode = subCode
-    item.StructureChanged = structChanged
-    item.SemanticsChanged = semChanged
-    item.InfoBits = infoBits
-    item.RawCode = rawCode
     // Snapshot for UI
     items := make([]*WatchItem, 0, len(c.watchItems))
     for _, wi := range c.watchItems { items = append(items, wi) }

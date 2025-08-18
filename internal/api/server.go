@@ -416,7 +416,7 @@ func StartServer(ctx context.Context, ctrl controller.NodeManager, apiStatus *st
 	}
 
 	go func() {
-		*apiStatus = "Running on :" + port
+		*apiStatus = "Running on:" + port
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			*apiStatus = "Error: " + err.Error()
 			if !hub.controller.IsLogDisabled() {
