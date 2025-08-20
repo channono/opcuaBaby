@@ -601,8 +601,8 @@ func NewUI(c *controller.Controller, apiStatus *string) *UI {
 	a := app.NewWithID("com.giantbaby.opcuababy") // Use App ID for storage
 	// Only change font on iOS; keep all other visuals from the default theme.
 	a.Settings().SetTheme(&fontOnlyTheme{base: theme.DefaultTheme()})
-	w := a.NewWindow("OPC UA Client - Big GiantBaby")
-	w.Resize(fyne.NewSize(1200, 800))
+	w := a.NewWindow("OpcUa Client - Big GiantBaby")
+	w.Resize(fyne.NewSize(1200, 860))
 
 	ui := &UI{
 		app:                    a,
@@ -1171,6 +1171,9 @@ func (ui *UI) showConfigDialog() {
 				certFileEntry.SetText(p)
 			}
 		}, ui.window)
+		// Enlarge the file dialog to make folder browsing easier
+		winSize := ui.window.Canvas().Size()
+		dlg.Resize(fyne.NewSize(winSize.Width*0.9, winSize.Height*0.9))
 		dlg.SetFilter(storage.NewExtensionFileFilter([]string{".der", ".crt", ".cer"}))
 		dlg.Show()
 	})
@@ -1193,6 +1196,9 @@ func (ui *UI) showConfigDialog() {
 				keyFileEntry.SetText(p)
 			}
 		}, ui.window)
+		// Enlarge the file dialog to make folder browsing easier
+		winSize := ui.window.Canvas().Size()
+		dlg.Resize(fyne.NewSize(winSize.Width*0.9, winSize.Height*0.9))
 		dlg.SetFilter(storage.NewExtensionFileFilter([]string{".key", ".pem"}))
 		dlg.Show()
 	})
@@ -1287,19 +1293,7 @@ func (ui *UI) showConfigDialog() {
 				authModeRadio.SetSelected(authOptions[0])
 			}
 
-			// If switching to Sign, prefer Username immediately
-			if mode == "Sign" {
-				userDisp := valueToDisplay["Username"]
-				// Only switch if available
-				for _, opt := range authModeRadio.Options {
-					if opt == userDisp && authModeRadio.Selected != userDisp {
-						authModeRadio.SetSelected(userDisp)
-						break
-					}
-				}
-			}
-
-			// Show cert/key for both Sign and SignAndEncrypt
+			// Do not force switch to Username; respect user's selected auth mode.
 			if mode == "SignAndEncrypt" || mode == "Sign" {
 				certRow.Show()
 				keyRow.Show()
@@ -1542,7 +1536,10 @@ func (ui *UI) showConfigDialog() {
 				}
 				content := container.NewVScroll(list)
 				content.SetMinSize(fyne.NewSize(480, 300))
-				picker = dialog.NewCustom(ui.t("select_endpoint"), ui.t("cancel_btn"), content, ui.window)
+				// Wrap content with a bordered themed panel to give the popup a border
+				borderBg := NewThemedArea(ui.app, func() color.Color { return theme.Color(theme.ColorNameBackground) }, 1, appleCornerRadius)
+				bordered := container.NewMax(borderBg, container.NewPadded(content))
+				picker = dialog.NewCustom(ui.t("select_endpoint"), ui.t("cancel_btn"), bordered, ui.window)
 				picker.Show()
 			})
 		}()
@@ -1571,44 +1568,63 @@ func (ui *UI) showConfigDialog() {
 		widget.NewFormItem(ui.t("language"), languageSelect),
 	}
 
-	d := dialog.NewForm(ui.t("connection_settings"), ui.t("save_btn"), ui.t("cancel_btn"), formItems, func(ok bool) {
-		if ok {
-			ui.config.EndpointURL = endpointEntry.Text
-			ui.endpointEntry.SetText(endpointEntry.Text)
-			ui.config.ApplicationURI = appURIEntry.Text
-			ui.config.ProductURI = productURIEntry.Text
-			ui.config.SecurityPolicy = policySelect.Selected
-			ui.config.SecurityMode = modeSelect.Selected
-			ui.config.AuthMode = displayToValue[authModeRadio.Selected]
-			ui.config.Username = userEntry.Text
-			ui.config.Password = passwordEntry.Text
-			ui.config.CertFile = certFileEntry.Text
-			ui.config.KeyFile = keyFileEntry.Text
-			ui.config.ApiPort = apiPortEntry.Text
-			ui.config.ApiEnabled = apiEnabledCheck.Checked
-			ui.config.AutoConnect = autoConnectCheck.Checked
-			ui.config.DisableLog = disableLogCheck.Checked
-
-			if code, ok := langDisplayToCode[languageSelect.Selected]; ok {
-				ui.config.Language = code
-			}
-
-			if timeout, err := strconv.ParseFloat(timeoutEntry.Text, 64); err == nil {
-				ui.config.ConnectTimeout = timeout
-			}
-			if sTimeout, err := strconv.ParseUint(sessionTimeoutEntry.Text, 10, 32); err == nil {
-				ui.config.SessionTimeout = uint32(sTimeout)
-			}
-
-			ui.saveConfig()
-			// Immediately apply language updates to all visible UI elements
-			ui.applyLanguage()
-			ui.controller.UpdateApiServerState(ui.config)
+	// Build custom form content so we can style buttons
+	formWidget := &widget.Form{Items: formItems}
+	// Ensure the Form does not render its own Cancel/Submit buttons
+	formWidget.OnSubmit = nil
+	formWidget.OnCancel = nil
+	formWidget.SubmitText = ""
+	formWidget.CancelText = ""
+	// Footer with buttons
+	var settingsDlg *dialog.CustomDialog
+	cancelBtn := widget.NewButtonWithIcon(ui.t("cancel_btn"), theme.CancelIcon(), func() {
+		if settingsDlg != nil {
+			settingsDlg.Hide()
 		}
-	}, ui.window)
+	})
+	cancelBtn.Importance = widget.MediumImportance // default style
+	saveBtn := widget.NewButtonWithIcon(ui.t("save_btn"), theme.ConfirmIcon(), func() {
+		// Save logic
+		ui.config.EndpointURL = endpointEntry.Text
+		ui.endpointEntry.SetText(endpointEntry.Text)
+		ui.config.ApplicationURI = appURIEntry.Text
+		ui.config.ProductURI = productURIEntry.Text
+		ui.config.SecurityPolicy = policySelect.Selected
+		ui.config.SecurityMode = modeSelect.Selected
+		ui.config.AuthMode = displayToValue[authModeRadio.Selected]
+		ui.config.Username = userEntry.Text
+		ui.config.Password = passwordEntry.Text
+		ui.config.CertFile = certFileEntry.Text
+		ui.config.KeyFile = keyFileEntry.Text
+		ui.config.ApiPort = apiPortEntry.Text
+		ui.config.ApiEnabled = apiEnabledCheck.Checked
+		ui.config.AutoConnect = autoConnectCheck.Checked
+		ui.config.DisableLog = disableLogCheck.Checked
 
-	d.Resize(fyne.NewSize(500, 400))
-	d.Show()
+		if code, ok := langDisplayToCode[languageSelect.Selected]; ok {
+			ui.config.Language = code
+		}
+		if timeout, err := strconv.ParseFloat(timeoutEntry.Text, 64); err == nil {
+			ui.config.ConnectTimeout = timeout
+		}
+		// Persist and apply changes
+		ui.saveConfig()
+		ui.applyLanguage()
+		if settingsDlg != nil {
+			settingsDlg.Hide()
+		}
+	})
+	saveBtn.Importance = widget.HighImportance
+
+	// Build dialog content with footer and subtle border
+	footer := container.NewHBox(layout.NewSpacer(), cancelBtn, saveBtn)
+	formContent := container.NewBorder(nil, footer, nil, nil, formWidget)
+	bg := NewThemedArea(ui.app, func() color.Color { return theme.Color(theme.ColorNameBackground) }, 1, appleCornerRadius)
+	bordered := container.NewMax(bg, container.NewPadded(formContent))
+
+	settingsDlg = dialog.NewCustomWithoutButtons(ui.t("connection_settings"), bordered, ui.window)
+	settingsDlg.Show()
+
 }
 
 func (ui *UI) updateWatchTableCell(id widget.TableCellID, obj fyne.CanvasObject) {
@@ -2235,9 +2251,11 @@ func (ui *UI) makeLayout() fyne.CanvasObject {
 	mainLayout.SetOffset(0.3)
 
 	// 顶部品牌栏（iOS 上无窗口标题，这里展示应用名与作者）- 无单独背景
+	appNameLabel := widget.NewLabelWithStyle("⛰️ OpcUaBaby 🌊", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	brandLabel := widget.NewLabelWithStyle(" 😃 Big GiantBaby 🍀", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true})
 	brand := container.NewPadded(
 		container.NewHBox(
+			appNameLabel,
 			layout.NewSpacer(),
 			brandLabel,
 		),
