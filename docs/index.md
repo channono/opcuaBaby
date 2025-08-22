@@ -3,7 +3,7 @@
 An OPC UA cross‑platform desktop client written in Go. Built‑in REST API and WebSocket streaming.
 
 - Repo: https://github.com/channono/opcuababy
-- OpenAPI: ../openapi.yaml
+- OpenAPI: openapi.yaml
 
 ## Install
 - Download binaries from Releases (macOS/Windows/Linux) once available.

@@ -1,0 +1,234 @@
+openapi: 3.0.3
+info:
+  title: opcuaBaby API
+  description: |
+    REST API for the opcuaBaby OPC UA desktop client. Provides endpoints to export
+    address space variables, read/write node values, and inspect WebSocket clients.
+
+    WebSocket streaming endpoint for live node updates is available at `GET /ws/subscribe`.
+  version: 0.1.0
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local embedded API server (default port)
+
+paths:
+  /export/tags:
+    get:
+      summary: Export all variables
+      description: Export all variables as JSON or CSV.
+      parameters:
+        - in: query
+          name: format
+          schema:
+            type: string
+            enum: [json, csv]
+          description: Output format (default json)
+      responses:
+        '200':
+          description: Exported variables
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Variable'
+              examples:
+                sample:
+                  value:
+                    - node_id: "ns=1;i=43335"
+                      browse_name: "MyVar"
+                      data_type: "Int32"
+                      value: 123
+            text/csv:
+              schema:
+                type: string
+              examples:
+                sample:
+                  value: |
+                    node_id,browse_name,data_type,value
+                    ns=1;i=43335,MyVar,Int32,123
+  /export/tags/folder:
+    get:
+      summary: Export variables under a folder
+      parameters:
+        - in: query
+          name: node_id
+          required: true
+          schema:
+            type: string
+          description: Folder NodeID
+        - in: query
+          name: recursive
+          schema:
+            type: boolean
+            default: true
+          description: Whether to recursively export nested folders
+        - in: query
+          name: format
+          schema:
+            type: string
+            enum: [json, csv]
+          description: Output format (default json)
+      responses:
+        '200':
+          description: Exported variables in the folder
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Variable'
+  /read:
+    post:
+      summary: Read a node value
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReadRequest'
+            examples:
+              sample:
+                value: { node_id: "ns=1;i=43335" }
+      responses:
+        '200':
+          description: Current value
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadResponse'
+              examples:
+                sample:
+                  value: { node_id: "ns=1;i=43335", data_type: "Int32", value: 123 }
+  /write:
+    post:
+      summary: Write a node value
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WriteRequest'
+            examples:
+              sample:
+                value: { node_id: "ns=1;i=43335", data_type: "Int32", value: "123" }
+      responses:
+        '200':
+          description: Write result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WriteResponse'
+              examples:
+                sample:
+                  value: { status: "Good" }
+  /ws/clients:
+    get:
+      summary: List active WebSocket clients
+      responses:
+        '200':
+          description: Active WebSocket clients
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WebSocketClient'
+
+components:
+  schemas:
+    Variable:
+      type: object
+      properties:
+        node_id:
+          type: string
+        browse_name:
+          type: string
+        data_type:
+          type: string
+        value:
+          description: Current value (type depends on data_type)
+    ReadRequest:
+      type: object
+      required: [node_id]
+      properties:
+        node_id:
+          type: string
+    ReadResponse:
+      type: object
+      properties:
+        node_id:
+          type: string
+        data_type:
+          type: string
+        value: {}
+    WriteRequest:
+      type: object
+      required: [node_id, data_type, value]
+      properties:
+        node_id:
+          type: string
+        data_type:
+          type: string
+          description: OPC UA built-in type name (e.g., Int32, Float, String)
+        value: {}
+    WriteResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          description: Result status (e.g., Good/Bad)
+    WebSocketClient:
+      type: object
+      properties:
+        id:
+          type: string
+        remote_addr:
+          type: string
+        subscribed_count:
+          type: integer
+          format: int32
+
+x-websocket:
+  subscribe:
+    summary: WebSocket subscribe endpoint
+    endpoint: /ws/subscribe
+    actions:
+      - action: subscribe
+        payload:
+          type: object
+          properties:
+            action:
+              type: string
+              enum: [subscribe]
+            node_ids:
+              type: array
+              items:
+                type: string
+      - action: unsubscribe
+        payload:
+          type: object
+          properties:
+            action:
+              type: string
+              enum: [unsubscribe]
+            node_ids:
+              type: array
+              items:
+                type: string
+      - action: subscribe_all
+        payload:
+          type: object
+          properties:
+            action:
+              type: string
+              enum: [subscribe_all]
+      - action: unsubscribe_all
+        payload:
+          type: object
+          properties:
+            action:
+              type: string
+              enum: [unsubscribe_all]
