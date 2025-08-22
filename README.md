@@ -1,12 +1,40 @@
 # opcuaBaby
 
-An OPC UA desktop client with a built‑in REST API and WebSocket streaming for tag updates.
+![Go](https://img.shields.io/badge/Go-1.21%2B-00ADD8?logo=go) ![License](https://img.shields.io/badge/License-MIT-green) ![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-informational)
+
+[English](#opcuaBaby) | [简体中文](#简体中文) | [日本語](#日本語)
+
+An OPC UA cross‑platform desktop client written in Go, with a built‑in REST API and WebSocket streaming for address space browse/read/write, tag subscriptions, and JSON/CSV export. Supports Security Policies None and Basic256Sha256 with Modes None/Sign/SignAndEncrypt, Anonymous and Username authentication, plus one‑click certificate generation.
+
+## Table of Contents
+- [Features](#features)
+- [Why opcuaBaby](#why-opcuababy)
+- [Build](#build)
+- [Run](#run)
+- [Connection Settings](#connection-settings)
+- [Simplified Certificates UI](#simplified-certificates-ui)
+- [Security & Authentication](#security--authentication)
+- [REST API](#rest-api)
+- [WebSocket](#websocket)
+- [Notes](#notes)
+- [FAQ](#faq)
+- [License](#license)
+- [简体中文](#简体中文)
+- [日本語](#日本語)
 
 ## Features
 * __OPC UA client__: Browse address space, read/write values, watch updates.
 * __REST API__: Export address space, read/write nodes via HTTP.
 * __WebSocket__: Subscribe to live watch updates.
 * __Config UI__: Simplified certificate section with a single Generate button.
+
+## Why opcuaBaby
+* __Built‑in APIs__: REST + WebSocket out of the box for automation and integrations.
+* __Simple security__: One‑click certificate generation; easy trust workflow.
+* __Fast export__: Dump variables as JSON/CSV; folder‑scoped export.
+* __Live watch streaming__: Subscribe/unsubscribe at runtime.
+* __Lightweight Go binary__: Cross‑platform desktop app with minimal footprint.
+* __Clear defaults__: Works with Security None + Anonymous for quick testing.
 
 ## Build
 Prerequisites: Go 1.21+.
@@ -33,6 +61,13 @@ Open Settings in the app to configure:
 
 ### Simplified Certificates UI
 Just one click Generate Certificates button. This generates and selects the local CA certificate and private key for the client security channel.  Ensure your server trusts the generated CA certificate for secure connections.
+
+## Security & Authentication
+* __Security Policies__: None, Basic256Sha256
+* __Security Modes__: None, Sign, SignAndEncrypt
+* __Authentication__: Anonymous, Username
+* __Behavior__: When Security Mode is `None`, certificate/key fields are hidden and only Anonymous auth is available.
+* __Certificates__: Use Generate to create/select the local CA cert/key, and trust the generated CA on your server for secure modes.
 
 ## REST API
 Base path: `/api/v1`
@@ -74,6 +109,17 @@ Live updates for watched nodes.
 * Default API port is `8080`. Change it in Settings.
 * When Security Mode is `None`, certificate/key fields are hidden and only Anonymous auth is available.
 * For secure modes, provide the certificate and key paths or use Generate to create/select the local CA cert/key.
+
+## FAQ
+* __Cannot connect to server?__
+  - Try Security Mode `None` + Anonymous first to validate connectivity.
+  - Verify the endpoint URL (e.g., `opc.tcp://host:4840`) and firewall rules.
+* __My server requires Anonymous with Security=None__
+  - Set Security Mode `None` and choose Anonymous. Certificate fields will be hidden by design.
+* __Secure connection fails due to trust__
+  - Export the generated CA certificate and add it to the server trust list.
+* __API port already in use__
+  - Change the API port in Settings or free the port.
 
 ## License
 MIT
