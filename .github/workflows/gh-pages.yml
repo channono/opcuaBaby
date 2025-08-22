@@ -40,18 +40,8 @@ jobs:
         run: |
           set -e
           mkdir -p docs
-          if [ -f docs/index.md ]; then
-            # Append README to existing docs/index.md, preserving current content (e.g., JSON-LD)
-            tmpfile=$(mktemp)
-            cat docs/index.md > "$tmpfile"
-            echo "" >> "$tmpfile"
-            echo "---" >> "$tmpfile"
-            echo "" >> "$tmpfile"
-            echo "## README" >> "$tmpfile"
-            echo "" >> "$tmpfile"
-            cat README.md >> "$tmpfile"
-            mv "$tmpfile" docs/index.md
-          else
+          if [ ! -f docs/index.md ]; then
+            # No docs homepage yet: use README as the site homepage
             printf "# opcuaBaby\n\n" > docs/index.md
             cat README.md >> docs/index.md
           fi
