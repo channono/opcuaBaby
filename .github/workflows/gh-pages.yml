@@ -40,11 +40,9 @@ jobs:
         run: |
           set -e
           mkdir -p docs
-          if [ ! -f docs/index.md ]; then
-            # No docs homepage yet: use README as the site homepage
-            printf "# opcuaBaby\n\n" > docs/index.md
-            cat README.md >> docs/index.md
-          fi
+          # Always use README as the site homepage
+          printf "# opcuaBaby\n\n" > docs/index.md
+          cat README.md >> docs/index.md
           if [ -d assets ]; then
             rm -rf docs/assets
             cp -R assets docs/assets
