@@ -16,4 +16,5 @@ markdown_extensions:
       permalink: true
 plugins:
   - search
+  - sitemap
 docs_dir: docs
