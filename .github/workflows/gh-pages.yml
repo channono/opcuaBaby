@@ -2,11 +2,7 @@ name: Deploy Docs (MkDocs)
 
 on:
   push:
-    branches: [ main, master ]
-    paths:
-      - 'docs/**'
-      - 'mkdocs.yml'
-      - '.github/workflows/gh-pages.yml'
+    branches: [ '**' ]
   workflow_dispatch: {}
 
 permissions:
