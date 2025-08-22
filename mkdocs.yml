@@ -12,8 +12,10 @@ theme:
 markdown_extensions:
   - admonition
   - codehilite
+  - attr_list
   - toc:
       permalink: true
 plugins:
   - search
+  - sitemap
 docs_dir: docs
