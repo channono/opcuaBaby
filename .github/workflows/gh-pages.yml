@@ -40,9 +40,11 @@ jobs:
         run: |
           set -e
           mkdir -p docs
-          # Always use README as the site homepage
-          printf "# opcuaBaby\n\n" > docs/index.md
-          cat README.md >> docs/index.md
+          # Always use README as the site homepage (no extra title to avoid duplicate H1)
+          cp README.md docs/index.md
+          # Fix README links for site context
+          # - Docs link should not point to ./docs/index.md inside the site
+          sed -i.bak 's#](./docs/index.md)#](./index.md)#g' docs/index.md && rm -f docs/index.md.bak
           if [ -d assets ]; then
             rm -rf docs/assets
             cp -R assets docs/assets
