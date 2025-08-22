@@ -1,8 +1,8 @@
 # opcuaBaby
 
-![Go](https://img.shields.io/badge/Go-1.21%2B-00ADD8?logo=go) ![License](https://img.shields.io/badge/License-MIT-green) ![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-informational)
+![Go](https://img.shields.io/badge/Go-1.21%2B-00ADD8?logo=go) [![Release](https://img.shields.io/github/v/release/channono/opcuababy?include_prereleases&label=release)](https://github.com/channono/opcuababy/releases) ![License](https://img.shields.io/badge/License-MIT-green) ![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-informational)
 
-[English](#opcuaBaby) | [简体中文](#简体中文) | [日本語](#日本語)
+[English](#opcuaBaby) | [简体中文](#简体中文) | [日本語](#日本語) • [OpenAPI Spec](./openapi.yaml) • [Docs](./docs/index.md)
 
 An OPC UA cross‑platform desktop client written in Go, with a built‑in REST API and WebSocket streaming for address space browse/read/write, tag subscriptions, and JSON/CSV export. Supports Security Policies None and Basic256Sha256 with Modes None/Sign/SignAndEncrypt, Anonymous and Username authentication, plus one‑click certificate generation.
 
@@ -18,6 +18,7 @@ An OPC UA cross‑platform desktop client written in Go, with a built‑in REST 
 - [WebSocket](#websocket)
 - [Notes](#notes)
 - [FAQ](#faq)
+- [Screenshots](#screenshots)
 - [License](#license)
 - [简体中文](#简体中文)
 - [日本語](#日本語)
@@ -109,6 +110,14 @@ Live updates for watched nodes.
 * Default API port is `8080`. Change it in Settings.
 * When Security Mode is `None`, certificate/key fields are hidden and only Anonymous auth is available.
 * For secure modes, provide the certificate and key paths or use Generate to create/select the local CA cert/key.
+
+## Screenshots
+<!-- TODO: Add real screenshots. Alt text is prepared for AI parsing. -->
+* __Main UI__: Application window showing address space browser, value panel, and watch list.
+* __Settings__: Connection settings with Endpoint URL, Security Mode, Authentication, API port.
+* __Certificates__: One‑click Generate Certificates flow and trust instructions.
+* __REST Demo__: Example read/write requests via HTTP client and JSON responses.
+* __WebSocket__: Live subscription updates stream view.
 
 ## FAQ
 * __Cannot connect to server?__

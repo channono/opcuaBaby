@@ -1,0 +1,19 @@
+site_name: opcuaBaby Docs
+site_description: Go-based OPC UA desktop client with REST API and WebSocket streaming.
+site_url: https://channono.github.io/opcuababy/
+repo_url: https://github.com/channono/opcuababy
+nav:
+  - Home: index.md
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - content.code.copy
+markdown_extensions:
+  - admonition
+  - codehilite
+  - toc:
+      permalink: true
+plugins:
+  - search
+docs_dir: docs
