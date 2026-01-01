@@ -3,8 +3,10 @@ package api
 import (
 	"context"
 	"encoding/csv"
+	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,7 +37,7 @@ type Client struct {
 	subscriptions map[string]bool
 	// If true, client receives all watch updates regardless of per-node subscriptions
 	subscribeAll bool
-	mu            sync.RWMutex
+	mu           sync.RWMutex
 }
 
 // Hub maintains the set of active clients and broadcasts messages to the
@@ -235,7 +237,9 @@ func StartServer(ctx context.Context, ctrl controller.NodeManager, apiStatus *st
 				return
 			}
 			format := strings.ToLower(strings.TrimSpace(c.Query("format")))
-			if format == "" { format = "json" }
+			if format == "" {
+				format = "json"
+			}
 			tags, err := ctrl.CollectVariableNodes("", true)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -246,8 +250,10 @@ func StartServer(ctx context.Context, ctrl controller.NodeManager, apiStatus *st
 				c.Header("Content-Type", "text/csv; charset=utf-8")
 				w := csv.NewWriter(c.Writer)
 				defer w.Flush()
-				_ = w.Write([]string{"NodeID","Name","DataType","Description","Path"})
-				for _, t := range tags { _ = w.Write([]string{t.NodeID, t.Name, t.DataType, t.Description, t.Path}) }
+				_ = w.Write([]string{"NodeID", "Name", "DataType", "Description", "Path"})
+				for _, t := range tags {
+					_ = w.Write([]string{t.NodeID, t.Name, t.DataType, t.Description, t.Path})
+				}
 				return
 			}
 			c.JSON(http.StatusOK, tags)
@@ -270,7 +276,9 @@ func StartServer(ctx context.Context, ctrl controller.NodeManager, apiStatus *st
 				recursive = rv != "false" && rv != "0"
 			}
 			format := strings.ToLower(strings.TrimSpace(c.Query("format")))
-			if format == "" { format = "json" }
+			if format == "" {
+				format = "json"
+			}
 			tags, err := ctrl.CollectVariableNodes(nodeID, recursive)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -281,8 +289,10 @@ func StartServer(ctx context.Context, ctrl controller.NodeManager, apiStatus *st
 				c.Header("Content-Type", "text/csv; charset=utf-8")
 				w := csv.NewWriter(c.Writer)
 				defer w.Flush()
-				_ = w.Write([]string{"NodeID","Name","DataType","Description","Path"})
-				for _, t := range tags { _ = w.Write([]string{t.NodeID, t.Name, t.DataType, t.Description, t.Path}) }
+				_ = w.Write([]string{"NodeID", "Name", "DataType", "Description", "Path"})
+				for _, t := range tags {
+					_ = w.Write([]string{t.NodeID, t.Name, t.DataType, t.Description, t.Path})
+				}
 				return
 			}
 			c.JSON(http.StatusOK, tags)
@@ -333,6 +343,160 @@ func StartServer(ctx context.Context, ctrl controller.NodeManager, apiStatus *st
 			ctrl.WriteValue(req.NodeID, req.DataType, req.Value)
 			c.JSON(http.StatusOK, gin.H{"status": "write request sent"})
 		})
+
+		// SBO endpoint
+		api.POST("/sbo", func(c *gin.Context) {
+			fullCtrl, ok := ctrl.(*controller.Controller)
+			if !ok {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+				return
+			}
+			if ctrl.GetClientContext() == nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "OPC UA connection is not active"})
+				return
+			}
+
+			var req struct {
+				ControlNode   string `json:"control_node" binding:"required"`
+				SelectMethod  string `json:"select_method" binding:"required"`
+				OperateMethod string `json:"operate_method" binding:"required"`
+				DataType      string `json:"data_type" binding:"required"`
+				Value         string `json:"value" binding:"required"`
+				TimeoutMs     int    `json:"timeout_ms"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			if req.TimeoutMs == 0 {
+				req.TimeoutMs = 5000
+			}
+			go func() {
+				err := fullCtrl.SelectThenOperate(req.ControlNode, req.SelectMethod, req.OperateMethod, req.DataType, req.Value, req.TimeoutMs)
+				if err != nil {
+					fullCtrl.Log(fmt.Sprintf("[red]SBO failed: %v[-]", err))
+				} else {
+					fullCtrl.Log("[green]SBO executed[-]")
+				}
+			}()
+			c.JSON(http.StatusOK, gin.H{"status": "sbo requested"})
+		})
+
+		// Event subscription endpoints
+		router.POST("/api/v1/events/subscribe", func(c *gin.Context) {
+			// Type assert to get the full controller
+			fullCtrl, ok := ctrl.(*controller.Controller)
+			if !ok {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+				return
+			}
+			if ctrl.GetClientContext() == nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "OPC UA connection is not active"})
+				return
+			}
+
+			var req struct {
+				NodeID string `json:"node_id" binding:"required"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+
+			go fullCtrl.SubscribeToEvents(req.NodeID)
+			c.JSON(http.StatusOK, gin.H{"status": "subscription requested", "node_id": req.NodeID})
+		})
+
+		router.POST("/api/v1/events/unsubscribe", func(c *gin.Context) {
+			// Type assert to get the full controller
+			fullCtrl, ok := ctrl.(*controller.Controller)
+			if !ok {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+				return
+			}
+			if ctrl.GetClientContext() == nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "OPC UA connection is not active"})
+				return
+			}
+
+			var req struct {
+				NodeID string `json:"node_id" binding:"required"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+
+			go fullCtrl.UnsubscribeFromEvents(req.NodeID)
+			c.JSON(http.StatusOK, gin.H{"status": "unsubscription requested", "node_id": req.NodeID})
+		})
+		// Dataset subscription endpoints (subscribe/unsubscribe to a ControlBlock dataset)
+		router.POST("/api/v1/dataset/subscribe", func(c *gin.Context) {
+			fullCtrl, ok := ctrl.(*controller.Controller)
+			if !ok {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+				return
+			}
+			var req struct {
+				NodeID string `json:"node_id" binding:"required"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			go fullCtrl.AddWatch(req.NodeID)
+			c.JSON(http.StatusOK, gin.H{"status": "dataset subscribe requested", "node_id": req.NodeID})
+		})
+
+		router.POST("/api/v1/dataset/unsubscribe", func(c *gin.Context) {
+			fullCtrl, ok := ctrl.(*controller.Controller)
+			if !ok {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+				return
+			}
+			var req struct {
+				NodeID string `json:"node_id" binding:"required"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			go fullCtrl.RemoveWatch(req.NodeID)
+			c.JSON(http.StatusOK, gin.H{"status": "dataset unsubscribe requested", "node_id": req.NodeID})
+		})
+
+		// Dataset history paging endpoint
+		router.GET("/api/v1/dataset/history", func(c *gin.Context) {
+			fullCtrl, ok := ctrl.(*controller.Controller)
+			if !ok {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+				return
+			}
+			nodeID := strings.TrimSpace(c.Query("node_id"))
+			if nodeID == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "node_id is required"})
+				return
+			}
+			offset := 0
+			limit := 50
+			if v := c.Query("offset"); v != "" {
+				if n, err := strconv.Atoi(v); err == nil {
+					offset = n
+				}
+			}
+			if v := c.Query("limit"); v != "" {
+				if n, err := strconv.Atoi(v); err == nil {
+					limit = n
+				}
+			}
+			hist, err := fullCtrl.GetDatasetHistory(nodeID, offset, limit)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"node_id": nodeID, "offset": offset, "limit": limit, "history": hist})
+		})
+
 	}
 
 	// WebSocket endpoint

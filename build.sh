@@ -11,12 +11,13 @@ APP_NAME="opcuaBaby"
 # 应用的唯一标识符 (通常是反向域名)
 APP_ID="com.giantbaby.opcua"
 # 应用图标文件 (确保文件名正确)
-ICON_FILE="opcuababy.icns"
+ICON_FILE="assets/icons/app.icns"
 # --------------------
 
 # 定义目标平台列表
 PLATFORMS=(
     "windows/amd64"
+    "windows/arm64"
     "darwin/amd64"
     #"darwin/arm64"
 )
@@ -37,7 +38,21 @@ for platform in "${PLATFORMS[@]}"; do
     # 执行 fyne-cross 命令，使用独立的 os 子命令和 -arch 标志
     # 这会创建一个更完整的应用程序包，而不仅仅是可执行文件
     if [ "$os" == "windows" ]; then
-       CGO_ENABLED=1 GOOS="$os"   GOARCH="$arch"   CC=x86_64-w64-mingw32-gcc fyne package    -name="$APP_NAME" -app-id="$APP_ID" -icon="$ICON_FILE"
+        if [ "$arch" == "amd64" ]; then
+            CGO_ENABLED=1 GOOS="$os" GOARCH="$arch" CC=x86_64-w64-mingw32-gcc fyne package -name="$APP_NAME" -app-id="$APP_ID" -icon="$ICON_FILE"
+        elif [ "$arch" == "arm64" ]; then
+            # 使用 Clang 进行 Windows ARM64 交叉编译
+            # 设置目标为 aarch64-w64-mingw32
+            CGO_ENABLED=1 \
+            GOOS="$os" \
+            GOARCH="$arch" \
+            CC="clang" \
+            CXX="clang++" \
+            CGO_CFLAGS="--target=aarch64-w64-mingw32" \
+            CGO_CXXFLAGS="--target=aarch64-w64-mingw32" \
+            CGO_LDFLAGS="--target=aarch64-w64-mingw32 -fuse-ld=lld" \
+            fyne package -name="$APP_NAME" -app-id="$APP_ID" -icon="$ICON_FILE"
+        fi
     fi
     if [ "$os" == "darwin" ]; then
       GOARCH="$arch"  fyne package  -target "$os"  -name="$APP_NAME" -app-id="$APP_ID" -icon="$ICON_FILE"

@@ -6,7 +6,6 @@ import (
 	"opcuababy/internal/ui"
 )
 
-
 func main() {
 	c := controller.New()
 	var apiStatus string

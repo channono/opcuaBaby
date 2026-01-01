@@ -15,37 +15,39 @@ import (
 
 // Config holds all the necessary connection parameters for an OPC UA client.
 type Config struct {
-	EndpointURL      string
-	SecurityPolicy   string
-	SecurityMode     string
-	AuthMode         string // "Anonymous", "Username", "Certificate"
-	Username         string
-	Password         string
+	EndpointURL    string
+	SecurityPolicy string
+	SecurityMode   string
+	AuthMode       string // "Anonymous", "Username", "Certificate"
+	Username       string
+	Password       string
 	// UserTokenPolicyID allows explicitly specifying the server's UserIdentityToken PolicyID
 	// (e.g., "anonymous", "username"). Some servers require the exact PolicyID; if not
 	// provided and no endpoint probing is performed, authentication may fail with
 	// StatusBadIdentityTokenInvalid.
 	UserTokenPolicyID string `json:"user_token_policy_id,omitempty"`
-	CertFile         string
-	KeyFile          string
-	ApplicationURI   string `json:"application_uri,omitempty"`
-	ProductURI       string `json:"product_uri,omitempty"`
+	CertFile          string
+	KeyFile           string
+	ApplicationURI    string `json:"application_uri,omitempty"`
+	ProductURI        string `json:"product_uri,omitempty"`
 	// SessionName is the OPC UA Session Name sent in CreateSession.
 	// If empty, it will default to ApplicationURI.
-	SessionName      string `json:"session_name,omitempty"`
-	SessionTimeout   uint32 `json:"session_timeout,omitempty"` // in seconds
-	ApiPort          string
-	ApiEnabled       bool    // Enable/disable the API/web server
-	DisableLog       bool    // When true, suppress UI/API logs
-	AutoConnect      bool    // Automatically connect on startup
-	ConnectTimeout   float64 `json:"connect_timeout,omitempty"`    // Connection timeout in seconds
+	SessionName    string `json:"session_name,omitempty"`
+	SessionTimeout uint32 `json:"session_timeout,omitempty"` // in seconds
+	ApiPort        string
+	ApiEnabled     bool    // Enable/disable the API/web server
+	DisableLog     bool    // When true, suppress UI/API logs
+	AutoConnect    bool    // Automatically connect on startup
+	ConnectTimeout float64 `json:"connect_timeout,omitempty"` // Connection timeout in seconds
 	// RetryAttempts controls how many times to try establishing a connection.
 	// 0 or 1 means single attempt (no retries). If omitted/zero, controller will default to 3.
-	RetryAttempts    int     `json:"retry_attempts,omitempty"`
+	RetryAttempts int `json:"retry_attempts,omitempty"`
 	// RetryDelaySeconds is the delay between attempts. If omitted/zero, controller will default to 1s.
 	RetryDelaySeconds float64 `json:"retry_delay_seconds,omitempty"`
-	Language         string  `json:"language,omitempty"`           // UI language code: "en", "zh"
-	AutoGenerateCert bool    `json:"auto_generate_cert,omitempty"` // Automatically generate certificates if missing
+	Language          string  `json:"language,omitempty"`           // UI language code: "en", "zh"
+	AutoGenerateCert  bool    `json:"auto_generate_cert,omitempty"` // Automatically generate certificates if missing
+	// PollIntervalMs controls how often the watchlist poller will read non-subscribed nodes (milliseconds)
+	PollIntervalMs    int     `json:"poll_interval_ms,omitempty"`
 }
 
 // ToOpcuaOptions converts the Config struct into a slice of opcua.Option
@@ -93,14 +95,21 @@ func (c *Config) ToOpcuaOptions() ([]opcua.Option, error) {
 		}
 	case "none":
 		pol = "None"
+	// Deprecated policies (for compatibility with older servers)
 	case "basic128rsa15":
 		pol = "http://opcfoundation.org/UA/SecurityPolicy#Basic128Rsa15"
 	case "basic256":
 		pol = "http://opcfoundation.org/UA/SecurityPolicy#Basic256"
+	// Modern recommended policy
 	case "basic256sha256":
 		pol = "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256"
-	case "aes128_sha256_rsaoaep", "aes128sha256rsaoaep", "basic256sha256rsaoaep":
+	// Modern AES encryption policies
+	case "aes128_sha256_rsaoaep", "aes128sha256rsaoaep":
 		pol = "http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep"
+	case "aes128_sha256_rsapss", "aes128sha256rsapss":
+		pol = "http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaPss"
+	case "aes256_sha256_rsaoaep", "aes256sha256rsaoaep":
+		pol = "http://opcfoundation.org/UA/SecurityPolicy#Aes256_Sha256_RsaOaep"
 	case "aes256_sha256_rsapss", "aes256sha256rsapss":
 		pol = "http://opcfoundation.org/UA/SecurityPolicy#Aes256_Sha256_RsaPss"
 	default:

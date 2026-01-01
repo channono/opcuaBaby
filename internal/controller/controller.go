@@ -8,6 +8,7 @@ import (
 	"crypto/sha1"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -59,6 +60,10 @@ type WatchItem struct {
 	RawCode          string
 
 	subHandle *opc.Subscription
+	// if this item belongs to a ControlBlock dataset
+	ParentNodeID string
+	// mark if node is a control block parent
+	IsControlBlock bool
 }
 
 // AddressSpaceNode 地址空间节点结构
@@ -71,14 +76,33 @@ type AddressSpaceNode struct {
 
 // NodeAttributes 节点详细属性
 type NodeAttributes struct {
-	NodeID      string
-	Name        string
-	Description string
-	NodeClass   string
-	DataType    string
-	AccessLevel string
-	Value       string
-	ValueRank   int // -1: scalar; 0 or >0: array (0 = any dims, >0 = number of dimensions)
+	NodeID                  string
+	NamespaceIndex          string
+	IdentifierType          string
+	Identifier              string
+	Name                    string
+	BrowseName              string
+	Description             string
+	NodeClass               string
+	DataType                string
+	AccessLevel             string
+	UserAccessLevel         string
+	Value                   string
+	ValueRank               int // -1: scalar; 0 or >0: array (0 = any dims, >0 = number of dimensions)
+	ArrayDimensions         string
+	Historizing             string
+	EventNotifier           string
+	EventNotifierFlags      string
+	WriteMask               string
+	WriteMaskFlags          string
+	UserWriteMask           string
+	UserWriteMaskFlags      string
+	RolePermissions         string
+	UserRolePermissions     string
+	AccessRestrictions      string
+	AccessRestrictionsFlags string
+	Executable              string
+	UserExecutable          string
 }
 
 // ExportTag represents a tag for export
@@ -88,6 +112,24 @@ type ExportTag struct {
 	DataType    string `json:"data_type,omitempty"`
 	Description string `json:"description,omitempty"`
 	Path        string `json:"path,omitempty"`
+}
+
+// EventItem 封装了从 OPC UA 事件中解析出的关键信息。
+type EventItem struct {
+	EventID    string
+	EventType  string
+	SourceName string
+	Time       time.Time
+	Message    string
+	Severity   uint16
+}
+
+// EventSource represents a node that can be an event source
+type EventSource struct {
+	NodeID             string
+	DisplayName        string
+	EventNotifier      string
+	EventNotifierFlags string
 }
 
 type Controller struct {
@@ -125,11 +167,34 @@ type Controller struct {
 	OnAddressSpaceReset    func()
 	OnWatchListUpdate      func(items []*WatchItem)
 	OnNodeAttributesUpdate func(attrs *NodeAttributes)
+	OnEventReceived        func(event *EventItem)
 
 	// Channels
 	AddressSpaceUpdateChan chan string
 	ApiBroadcastChan       chan *WatchItem
 	LogChan                chan string
+	// dataset history for per-controlblock aggregation
+	datasetHistory map[string][]string
+	// datasetBuffers for received PubSub payloads: parentNodeID -> memberNodeID -> {value,timestamp,severity}
+	datasetBuffers map[string]map[string]struct {
+		Value     string
+		Timestamp string
+		Severity  string
+	}
+	// ordered members
+	datasetMembers map[string][]string
+	// seq counters
+	datasetSeq map[string]uint64
+	// internal poller state
+	pollerRunning bool
+}
+
+// HasDataset reports whether controller has metadata for a dataset parent node
+func (c *Controller) HasDataset(nodeID string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.datasetMembers[nodeID]
+	return ok
 }
 
 func New() *Controller {
@@ -142,6 +207,14 @@ func New() *Controller {
 		AddressSpaceUpdateChan: make(chan string, 64),
 		ApiBroadcastChan:       make(chan *WatchItem, 64),
 		LogChan:                make(chan string, 256),
+		datasetHistory:         make(map[string][]string),
+		datasetBuffers: make(map[string]map[string]struct {
+			Value     string
+			Timestamp string
+			Severity  string
+		}),
+		datasetMembers: make(map[string][]string),
+		datasetSeq:     make(map[string]uint64),
 	}
 }
 
@@ -164,6 +237,310 @@ func (c *Controller) IsLogDisabled() bool {
 	cfg := c.currentConfig
 	c.mu.RUnlock()
 	return cfg != nil && cfg.DisableLog
+}
+
+// HandleEvent satisfies opc.DataChangeHandler interface for event notifications
+func (c *Controller) HandleEvent(nodeID string, fields []*ua.Variant) {
+	msg := ""
+	if len(fields) > 0 && fields[0] != nil {
+		msg = fmt.Sprintf("%v", fields[0].Value())
+	}
+	e := &EventItem{EventID: nodeID, EventType: "GenericEvent", SourceName: nodeID, Time: time.Now(), Message: msg}
+	if c.OnEventReceived != nil {
+		c.OnEventReceived(e)
+	}
+	c.Log(fmt.Sprintf("[cyan]Event from %s: %s[-]", nodeID, msg))
+}
+
+func (c *Controller) SubscribeToEvents(nodeID string) error {
+	c.mu.RLock()
+	cli := c.client
+	c.mu.RUnlock()
+	if cli == nil {
+		return fmt.Errorf("not connected")
+	}
+	_, err := cli.MonitorEvents(nodeID)
+	if err != nil {
+		return err
+	}
+	c.Log(fmt.Sprintf("[green]Subscribed to events on %s[-]", nodeID))
+	return nil
+}
+
+func (c *Controller) UnsubscribeFromEvents(nodeID string) error {
+	c.mu.RLock()
+	cli := c.client
+	c.mu.RUnlock()
+	if cli == nil {
+		return fmt.Errorf("not connected")
+	}
+	return cli.UnmonitorItem(nodeID)
+}
+
+func (c *Controller) GetDatasetHistory(nodeID string, offset, limit int) ([]string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if nodeID == "" {
+		return nil, fmt.Errorf("nodeID required")
+	}
+	h, ok := c.datasetHistory[nodeID]
+	if !ok {
+		return []string{}, nil
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(h) {
+		return []string{}, nil
+	}
+	end := offset + limit
+	if end > len(h) {
+		end = len(h)
+	}
+	return h[offset:end], nil
+}
+
+func (c *Controller) SelectThenOperate(controlNode, selectMethod, operateMethod, dataType, valueStr string, timeoutMs int) error {
+	c.mu.RLock()
+	cli := c.client
+	c.mu.RUnlock()
+	if cli == nil {
+		return errors.New("not connected")
+	}
+	val, err := convertStringToType(valueStr, dataType)
+	if err != nil {
+		return fmt.Errorf("value conversion failed: %v", err)
+	}
+	// simple: try call-based
+	if selectMethod != "" && operateMethod != "" {
+		if outs, err := cli.CallMethod(controlNode, selectMethod); err == nil {
+			var token interface{}
+			if len(outs) > 0 {
+				token = outs[0].Value()
+			}
+			if token != nil {
+				if _, err := cli.CallMethod(controlNode, operateMethod, token, val); err == nil {
+					return nil
+				}
+			}
+			if _, err := cli.CallMethod(controlNode, operateMethod, val); err == nil {
+				return nil
+			}
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+	defer cancel()
+	if selectMethod != "" {
+		_ = cli.WriteValue(ctx, selectMethod, true)
+		// brief wait
+		time.Sleep(100 * time.Millisecond)
+	}
+	if operateMethod != "" {
+		if err := cli.WriteValue(ctx, operateMethod, val); err == nil {
+			return nil
+		}
+	}
+	// rollback select
+	if selectMethod != "" {
+		_ = cli.WriteValue(context.Background(), selectMethod, false)
+	}
+	return fmt.Errorf("SBO failed for %s", controlNode)
+}
+
+// SubscribeToDataSetReader attempts to discover PublishedDataSet/DataSetReader children under nodeID and subscribe to its variables.
+func (c *Controller) SubscribeToDataSetReader(nodeID string) error {
+	c.mu.RLock()
+	cli := c.client
+	ctx := c.clientCtx
+	c.mu.RUnlock()
+	if cli == nil || ctx == nil {
+		return fmt.Errorf("not connected")
+	}
+
+	nID, err := ua.ParseNodeID(nodeID)
+	if err != nil {
+		return err
+	}
+	refs, err := cli.Browse(ctx, nID)
+	if err != nil {
+		return err
+	}
+
+	// First, check if nodeID itself has Variable children (some servers expose PublishedDataSet as variables directly)
+	children := make([]string, 0)
+	for _, r := range refs {
+		if r == nil || r.NodeID == nil {
+			continue
+		}
+		if r.NodeClass == ua.NodeClassVariable {
+			if r.NodeID.NodeID != nil {
+				children = append(children, r.NodeID.NodeID.String())
+			} else {
+				children = append(children, r.NodeID.String())
+			}
+		}
+	}
+	if len(children) > 0 {
+		sub, merr := cli.MonitorMultiple(children, nodeID)
+		if merr != nil {
+			return merr
+		}
+		c.mu.Lock()
+		// ensure or create parent watch item and attach subscription
+		if p, ok := c.watchItems[nodeID]; !ok {
+			c.watchItems[nodeID] = &WatchItem{NodeID: nodeID, Name: "DataSet", IsControlBlock: true, subHandle: sub}
+		} else {
+			p.IsControlBlock = true
+			p.subHandle = sub
+		}
+		for i, ch := range children {
+			wi := &WatchItem{NodeID: ch, ParentNodeID: nodeID}
+			if attrs, aerr := c.ReadNodeAttributes(ch); aerr == nil && attrs != nil {
+				wi.DataType = attrs.DataType
+				wi.Name = attrs.Name
+			}
+			c.watchItems[ch] = wi
+			_ = i
+		}
+		if c.datasetBuffers == nil {
+			c.datasetBuffers = make(map[string]map[string]struct {
+				Value     string
+				Timestamp string
+				Severity  string
+			})
+		}
+		if c.datasetBuffers[nodeID] == nil {
+			c.datasetBuffers[nodeID] = make(map[string]struct {
+				Value     string
+				Timestamp string
+				Severity  string
+			})
+		}
+		c.datasetMembers[nodeID] = append([]string(nil), children...)
+		c.datasetSeq[nodeID] = 0
+		c.mu.Unlock()
+		c.Log(fmt.Sprintf("[green]Subscribed to DataSet variables under %s with %d members[-]", nodeID, len(children)))
+		return nil
+	}
+
+	// Otherwise try to find PublishedDataSet/DataSetReader-like children
+	for _, ref := range refs {
+		if ref == nil || ref.NodeID == nil {
+			continue
+		}
+		name := strings.ToLower(ref.DisplayName.Text)
+		if strings.Contains(name, "dataset") || strings.Contains(name, "publish") || strings.Contains(name, "reader") {
+			var datasetNodeID string
+			if ref.NodeID.NodeID != nil {
+				datasetNodeID = ref.NodeID.NodeID.String()
+			} else {
+				datasetNodeID = ref.NodeID.String()
+			}
+			if datasetNodeID == "" {
+				continue
+			}
+			cid, perr := ua.ParseNodeID(datasetNodeID)
+			if perr != nil {
+				continue
+			}
+			crefs, cerr := cli.Browse(ctx, cid)
+			if cerr != nil || len(crefs) == 0 {
+				continue
+			}
+			children := make([]string, 0)
+			for _, cr := range crefs {
+				if cr == nil || cr.NodeID == nil {
+					continue
+				}
+				if cr.NodeClass != ua.NodeClassVariable {
+					continue
+				}
+				if cr.NodeID.NodeID != nil {
+					children = append(children, cr.NodeID.NodeID.String())
+				} else {
+					children = append(children, cr.NodeID.String())
+				}
+			}
+			if len(children) == 0 {
+				continue
+			}
+			sub, merr := cli.MonitorMultiple(children, datasetNodeID)
+			if merr != nil {
+				return merr
+			}
+			c.mu.Lock()
+			if it, ok := c.watchItems[datasetNodeID]; ok {
+				it.IsControlBlock = true
+				it.subHandle = sub
+			}
+			for i, ch := range children {
+				wi := &WatchItem{NodeID: ch, ParentNodeID: datasetNodeID}
+				if attrs, aerr := c.ReadNodeAttributes(ch); aerr == nil && attrs != nil {
+					wi.DataType = attrs.DataType
+					wi.Name = attrs.Name
+				}
+				c.watchItems[ch] = wi
+				_ = i
+			}
+			if c.datasetBuffers == nil {
+				c.datasetBuffers = make(map[string]map[string]struct {
+					Value     string
+					Timestamp string
+					Severity  string
+				})
+			}
+			if c.datasetBuffers[datasetNodeID] == nil {
+				c.datasetBuffers[datasetNodeID] = make(map[string]struct {
+					Value     string
+					Timestamp string
+					Severity  string
+				})
+			}
+			c.datasetMembers[datasetNodeID] = append([]string(nil), children...)
+			c.datasetSeq[datasetNodeID] = 0
+			c.mu.Unlock()
+			c.Log(fmt.Sprintf("[green]Subscribed to DataSetReader %s with %d members[-]", datasetNodeID, len(children)))
+			return nil
+		}
+	}
+
+	return fmt.Errorf("no DataSetReader-like children found under %s", nodeID)
+}
+
+func (c *Controller) BrowseEventSources(startNodeID string) ([]EventSource, error) {
+	c.mu.RLock()
+	cli := c.client
+	c.mu.RUnlock()
+	if cli == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	id, err := ua.ParseNodeID(startNodeID)
+	if err != nil {
+		return nil, err
+	}
+	refs, err := cli.Browse(context.Background(), id)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]EventSource, 0)
+	for _, r := range refs {
+		if r == nil {
+			continue
+		}
+		var nid string
+		if r.NodeID != nil {
+			if r.NodeID.NodeID != nil {
+				nid = r.NodeID.NodeID.String()
+			} else {
+				nid = r.NodeID.String()
+			}
+		}
+		out = append(out, EventSource{NodeID: nid, DisplayName: r.DisplayName.Text})
+	}
+	return out, nil
 }
 
 func (c *Controller) Connect(cfg *opc.Config) error {
@@ -372,11 +749,11 @@ func (c *Controller) Connect(cfg *opc.Config) error {
 				attempted++
 				c.Log(fmt.Sprintf("[yellow]Trying Anonymous endpoint: %s / %s @ %s[-]", r.ep.SecurityPolicyURI, r.ep.SecurityMode.String(), connectURL))
 				if km != nil && strings.TrimSpace(km.appURI) != "" {
-                    c.Log(fmt.Sprintf("[blue]Using ApplicationURI for session: %s; cert URIs: %v[-]", km.appURI, km.certURIs))
-                } else {
-                    c.Log(fmt.Sprintf("[blue]Using ApplicationURI for session: %s; cert URIs: %v[-]", strings.TrimSpace(cfg.ApplicationURI), nil))
-                }
-                tmpCli, cerr := opc.NewClient(connectURL, optsAnon...)
+					c.Log(fmt.Sprintf("[blue]Using ApplicationURI for session: %s; cert URIs: %v[-]", km.appURI, km.certURIs))
+				} else {
+					c.Log(fmt.Sprintf("[blue]Using ApplicationURI for session: %s; cert URIs: %v[-]", strings.TrimSpace(cfg.ApplicationURI), nil))
+				}
+				tmpCli, cerr := opc.NewClient(connectURL, optsAnon...)
 				if cerr != nil {
 					lastErr = cerr
 					c.Log(fmt.Sprintf("[red]Create client failed (Anonymous %s/%s): %v[-]", r.ep.SecurityPolicyURI, r.ep.SecurityMode.String(), cerr))
@@ -469,11 +846,11 @@ func (c *Controller) Connect(cfg *opc.Config) error {
 				attempted++
 				c.Log(fmt.Sprintf("[yellow]Trying Username endpoint: %s / %s @ %s[-]", cand.ep.SecurityPolicyURI, cand.ep.SecurityMode.String(), connectURL))
 				if km != nil && strings.TrimSpace(km.appURI) != "" {
-                    c.Log(fmt.Sprintf("[blue]Using ApplicationURI for session: %s; cert URIs: %v[-]", km.appURI, km.certURIs))
-                } else {
-                    c.Log(fmt.Sprintf("[blue]Using ApplicationURI for session: %s; cert URIs: %v[-]", strings.TrimSpace(cfg.ApplicationURI), nil))
-                }
-                tmpCli, cerr := opc.NewClient(connectURL, tryOpts...)
+					c.Log(fmt.Sprintf("[blue]Using ApplicationURI for session: %s; cert URIs: %v[-]", km.appURI, km.certURIs))
+				} else {
+					c.Log(fmt.Sprintf("[blue]Using ApplicationURI for session: %s; cert URIs: %v[-]", strings.TrimSpace(cfg.ApplicationURI), nil))
+				}
+				tmpCli, cerr := opc.NewClient(connectURL, tryOpts...)
 				if cerr != nil {
 					lastErr = cerr
 					c.Log(fmt.Sprintf("[red]Create client failed for %s / %s: %v[-]", cand.ep.SecurityPolicyURI, cand.ep.SecurityMode.String(), cerr))
@@ -849,8 +1226,7 @@ func (c *Controller) AddWatch(nodeID string) {
 	cli := c.client
 	c.mu.RUnlock()
 	if cli == nil {
-		c.Log(fmt.Sprintf("[red]AddWatch failed: not connected (node %s)[-]", nodeID))
-		return
+		c.Log(fmt.Sprintf("[yellow]AddWatch: client not connected, will poll when connected (%s)[-]", nodeID))
 	}
 
 	// Create entry or return if exists
@@ -875,17 +1251,21 @@ func (c *Controller) AddWatch(nodeID string) {
 		c.mu.Unlock()
 	}
 
-	// Start monitoring value changes
-	sub, err := cli.MonitorItem(nodeID)
-	if err != nil {
-		c.Log(fmt.Sprintf("[red]Failed to monitor %s: %v[-]", nodeID, err))
-	} else {
-		c.mu.Lock()
-		if it, ok := c.watchItems[nodeID]; ok {
-			it.subHandle = sub
+	// Start monitoring value changes (if connected)
+	if cli != nil {
+		sub, err := cli.MonitorItem(nodeID)
+		if err != nil {
+			c.Log(fmt.Sprintf("[red]Failed to monitor %s: %v[-]", nodeID, err))
+		} else {
+			c.mu.Lock()
+			if it, ok := c.watchItems[nodeID]; ok {
+				it.subHandle = sub
+			}
+			c.mu.Unlock()
+			c.Log(fmt.Sprintf("[green]Monitoring %s started[-]", nodeID))
 		}
-		c.mu.Unlock()
-		c.Log(fmt.Sprintf("[green]Monitoring %s started[-]", nodeID))
+	} else {
+		c.Log(fmt.Sprintf("[yellow]Monitoring deferred for %s until connected[-]", nodeID))
 	}
 
 	// Push snapshot to UI
@@ -914,6 +1294,14 @@ func (c *Controller) AddWatch(nodeID string) {
 	if cb != nil {
 		cb(items)
 	}
+
+	// Start background poller (if not already running)
+	c.mu.Lock()
+	if !c.pollerRunning {
+		c.pollerRunning = true
+		go c.watchPoller()
+	}
+	c.mu.Unlock()
 }
 
 func (c *Controller) GetClientForExport() *opc.Client {
@@ -921,6 +1309,56 @@ func (c *Controller) GetClientForExport() *opc.Client {
 	cli := c.client
 	c.mu.RUnlock()
 	return cli
+}
+
+// watchPoller polls watchlist nodes that are not subscribed via OPC UA subscription
+func (c *Controller) watchPoller() {
+	for {
+		c.mu.RLock()
+		cli := c.client
+		ctx := c.clientCtx
+		cfg := c.currentConfig
+		c.mu.RUnlock()
+
+		pollMs := 500
+		if cfg != nil && cfg.PollIntervalMs > 0 {
+			pollMs = cfg.PollIntervalMs
+		}
+
+		if cli == nil || ctx == nil {
+			select {
+			case <-time.After(time.Duration(pollMs) * time.Millisecond):
+				continue
+			}
+		}
+
+		// collect nodes needing polling
+		c.mu.RLock()
+		nodes := make([]string, 0, len(c.watchItems))
+		for nid, wi := range c.watchItems {
+			if wi == nil || wi.subHandle != nil {
+				continue
+			}
+			nodes = append(nodes, nid)
+		}
+		c.mu.RUnlock()
+
+		// poll sequentially
+		for _, nid := range nodes {
+			vals, err := cli.ReadAttributes(ctx, nid, ua.AttributeIDValue)
+			if err != nil || len(vals) == 0 || vals[0] == nil {
+				continue
+			}
+			// forward into existing handler
+			c.HandleDataChange(nid, vals[0])
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Duration(pollMs) * time.Millisecond):
+		}
+	}
 }
 
 // SetApiStarter injects the API server start function to avoid import cycles.
@@ -1000,6 +1438,119 @@ func (c *Controller) HandleDataChange(nodeID string, dv *ua.DataValue) {
 		item.InfoBits = infoBits
 		item.RawCode = rawCode
 	}
+	// If this item belongs to a ControlBlock dataset, aggregate into parent
+	if item.ParentNodeID != "" {
+		parent := item.ParentNodeID
+		if c.datasetBuffers == nil {
+			c.datasetBuffers = make(map[string]map[string]struct {
+				Value     string
+				Timestamp string
+				Severity  string
+			})
+		}
+		if c.datasetBuffers[parent] == nil {
+			c.datasetBuffers[parent] = make(map[string]struct {
+				Value     string
+				Timestamp string
+				Severity  string
+			})
+		}
+		c.datasetBuffers[parent][nodeID] = struct {
+			Value     string
+			Timestamp string
+			Severity  string
+		}{Value: item.Value, Timestamp: item.Timestamp, Severity: item.Severity}
+		// build structured JSON payload from buffer
+		c.datasetSeq[parent] = c.datasetSeq[parent] + 1
+		seq := c.datasetSeq[parent]
+		payload := make(map[string]interface{})
+		// prefer parent watch name
+		if p, ok := c.watchItems[parent]; ok && p.Name != "" {
+			payload["datasetId"] = p.Name
+		} else {
+			payload["datasetId"] = parent
+		}
+		payload["seqOfChanges"] = seq
+		// compute dataset-level quality (worst of members)
+		severityRank := map[string]int{"Good": 1, "Uncertain": 2, "Bad": 3}
+		worst := "Good"
+		for _, m := range c.datasetBuffers[parent] {
+			if r, ok := severityRank[m.Severity]; ok {
+				if r > severityRank[worst] {
+					worst = m.Severity
+				}
+			}
+		}
+		payload["quality"] = worst
+		// dataset-level timestamp is now (represents dataset aggregation time)
+		datasetTS := time.Now().Format(time.RFC3339Nano)
+		payload["timestamp"] = datasetTS
+		membersArr := make([]map[string]interface{}, 0)
+		// use recorded ordering if available
+		if order, ok := c.datasetMembers[parent]; ok && len(order) > 0 {
+			for idx, member := range order {
+				if v, ok2 := c.datasetBuffers[parent][member]; ok2 {
+					child := map[string]interface{}{"index": idx, "nodeId": member, "dataType": "", "value": v.Value, "timestamp": v.Timestamp, "quality": v.Severity}
+					if wi, ok3 := c.watchItems[member]; ok3 {
+						child["dataType"] = wi.DataType
+						child["name"] = wi.Name
+					}
+					membersArr = append(membersArr, child)
+				} else {
+					membersArr = append(membersArr, map[string]interface{}{"index": idx, "nodeId": member, "value": nil, "timestamp": "", "quality": "Unknown"})
+				}
+			}
+		} else {
+			for member, v := range c.datasetBuffers[parent] {
+				child := map[string]interface{}{"nodeId": member, "value": v.Value, "timestamp": v.Timestamp, "quality": v.Severity}
+				if wi, ok3 := c.watchItems[member]; ok3 {
+					child["dataType"] = wi.DataType
+					child["name"] = wi.Name
+				}
+				membersArr = append(membersArr, child)
+			}
+		}
+		payload["members"] = membersArr
+		b, _ := json.Marshal(payload)
+		// update parent WatchItem
+		if p, ok2 := c.watchItems[parent]; ok2 {
+			p.Value = string(b)
+			p.Timestamp = time.Now().Format("15:04:05.000")
+			p.Severity = worst
+		}
+		// append to history
+		h := c.datasetHistory[parent]
+		h = append(h, string(b))
+		if len(h) > 200 {
+			h = h[len(h)-200:]
+		}
+		c.datasetHistory[parent] = h
+		// prepare broadcast for parent
+		msg := WatchItem{}
+		if p, ok2 := c.watchItems[parent]; ok2 {
+			msg = *p
+			msg.subHandle = nil
+		}
+		// snapshot for UI
+		items := make([]*WatchItem, 0, len(c.watchItems))
+		for _, wi := range c.watchItems {
+			items = append(items, wi)
+		}
+		sort.Slice(items, func(i, j int) bool { return items[i].NodeID < items[j].NodeID })
+		update := c.OnWatchListUpdate
+		broadcast := c.ApiBroadcastChan
+		c.mu.Unlock()
+
+		if update != nil {
+			update(items)
+		}
+		select {
+		case broadcast <- &msg:
+		default:
+		}
+		return
+	}
+
 	// Snapshot for UI
 	items := make([]*WatchItem, 0, len(c.watchItems))
 	for _, wi := range c.watchItems {

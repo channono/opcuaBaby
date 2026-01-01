@@ -11,6 +11,7 @@ import (
 	"opcuababy/internal/exporter"
 	"opcuababy/internal/opc"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -206,6 +207,9 @@ var i18n = map[string]map[string]string{
 		"clear_logs":          "Clear Logs",
 		"copy":                "Copy",
 		"running_on":          "Running on",
+		"events":              "Events",
+		"event_source_nodeid": "Event Source NodeID",
+		"subscribe_events":    "Subscribe to Events",
 		// Auth mode labels (for localization of radio group)
 		"anonymous":          "Anonymous",
 		"username":           "Username",
@@ -276,6 +280,9 @@ var i18n = map[string]map[string]string{
 		"clear_logs":          "清空日志",
 		"copy":                "复制",
 		"running_on":          "运行在",
+		"events":              "事件",
+		"event_source_nodeid": "事件源NodeID",
+		"subscribe_events":    "订阅事件",
 		// Auth mode labels
 		"anonymous":          "匿名",
 		"username":           "用户名",
@@ -348,6 +355,10 @@ func (ui *UI) applyLanguage() {
 	if ui.watchBtn != nil {
 		ui.watchBtn.SetText(ui.t("add_to_watch"))
 		ui.watchBtn.Refresh()
+	}
+	if ui.datasetHistoryBtn != nil {
+		ui.datasetHistoryBtn.SetText("History")
+		ui.datasetHistoryBtn.Refresh()
 	}
 	if ui.removeWatchBtn != nil {
 		ui.removeWatchBtn.SetText(ui.t("remove"))
@@ -554,6 +565,19 @@ type UI struct {
 	watchCard       *widget.Card
 	detailsCard     *widget.Card
 	detailsTitleLbl *widget.Label
+	// dataset history button (appears when a ControlBlock dataset is selected)
+	datasetHistoryBtn *widget.Button
+
+	// Event subscription and display
+	eventSourceEntry     *widget.Entry
+	subscribeEventsBtn   *widget.Button
+	unsubscribeEventsBtn *widget.Button
+	eventStatusLabel     *widget.Label
+	eventData            []*controller.EventItem
+	eventList            *widget.List
+	eventCard            *widget.Card
+	currentEventSource   string
+	currentEventSourceMu sync.Mutex
 
 	// ...
 	config *opc.Config
@@ -601,7 +625,9 @@ func NewUI(c *controller.Controller, apiStatus *string) *UI {
 	a := app.NewWithID("com.giantbaby.opcuababy") // Use App ID for storage
 	// Only change font on iOS; keep all other visuals from the default theme.
 	a.Settings().SetTheme(&fontOnlyTheme{base: theme.DefaultTheme()})
-	w := a.NewWindow("OpcUa Client - Big GiantBaby")
+	// Add Build ID to window title for version verification
+	buildID := time.Now().Format("20060102-150405")
+	w := a.NewWindow(fmt.Sprintf("OpcUa Client - Big GiantBaby [Build: %s]", buildID))
 	w.Resize(fyne.NewSize(1200, 860))
 
 	ui := &UI{
@@ -753,7 +779,31 @@ func (ui *UI) initWidgets() {
 		if ui.nodeTree.IsBranch(uid) {
 			ui.nodeTree.ToggleBranch(uid)
 		}
-		go ui.controller.ReadNodeAttributes(string(uid))
+		go func() {
+			attrs, err := ui.controller.ReadNodeAttributes(string(uid))
+			if err == nil && attrs != nil {
+				// Auto-fill event source if node is an Object with SubscribeToEvents capability
+				if attrs.NodeClass == "Object" && attrs.EventNotifier != "" {
+					// Check if SubscribeToEvents bit (0x1) is set
+					if strings.Contains(strings.ToLower(attrs.EventNotifierFlags), "subscribetoevents") {
+						fyne.Do(func() {
+							ui.eventSourceEntry.SetText(string(uid))
+						})
+					}
+				}
+				// Enable dataset history button if this node is a known dataset parent
+				hasDataset := ui.controller.HasDataset(string(uid))
+				fyne.Do(func() {
+					if ui.datasetHistoryBtn != nil {
+						if hasDataset {
+							ui.datasetHistoryBtn.Enable()
+						} else {
+							ui.datasetHistoryBtn.Disable()
+						}
+					}
+				})
+			}
+		}()
 	}
 	ui.nodeTree.OnUnselected = func(uid widget.TreeNodeID) {
 		//ui.controller.Log(fmt.Sprintf("[blue]Tree OnUnselected: %s[-]", string(uid)))
@@ -850,6 +900,13 @@ func (ui *UI) initWidgets() {
 			ui.controller.AddWatch(string(ui.selectedNodeID))
 		}
 	})
+	// Dataset history button
+	ui.datasetHistoryBtn = widget.NewButton("History", func() {
+		if ui.selectedNodeID != "" {
+			go ui.showDatasetHistoryDialog(string(ui.selectedNodeID))
+		}
+	})
+	ui.datasetHistoryBtn.Disable()
 
 	// 【已修正】: 清理了所有混乱的旧代码和语法错误，只保留正确的实现。
 	ui.writeBtn = widget.NewButtonWithIcon(ui.t("write_value"), theme.DocumentCreateIcon(), func() {
@@ -886,6 +943,81 @@ func (ui *UI) initWidgets() {
 	ui.logText.Wrapping = fyne.TextWrapOff
 	ui.logText.Segments = []widget.RichTextSegment{&widget.TextSegment{Text: "", Style: widget.RichTextStyleInline}}
 	ui.logScroll = container.NewScroll(ui.logText)
+
+	// Event subscription widgets
+	ui.eventSourceEntry = widget.NewEntry()
+	ui.eventSourceEntry.SetPlaceHolder(ui.t("event_source_nodeid"))
+	ui.eventSourceEntry.SetText("i=2253") // Default to server object for events
+
+	ui.subscribeEventsBtn = widget.NewButtonWithIcon(ui.t("subscribe_events"), theme.MediaPlayIcon(), func() {
+		if ui.eventSourceEntry.Text != "" {
+			nodeID := ui.eventSourceEntry.Text
+			go func() {
+				ui.controller.SubscribeToEvents(nodeID)
+				// Update status on success
+				ui.currentEventSourceMu.Lock()
+				ui.currentEventSource = nodeID
+				ui.currentEventSourceMu.Unlock()
+				fyne.Do(func() {
+					if attrs, err := ui.controller.ReadNodeAttributes(nodeID); err == nil && attrs != nil {
+						ui.eventStatusLabel.SetText(fmt.Sprintf("Subscribed: %s / %s [%s]", attrs.Name, nodeID, time.Now().Format("15:04:05")))
+					} else {
+						ui.eventStatusLabel.SetText(fmt.Sprintf("Subscribed: %s [%s]", nodeID, time.Now().Format("15:04:05")))
+					}
+				})
+			}()
+		}
+	})
+
+	ui.unsubscribeEventsBtn = widget.NewButtonWithIcon("Unsubscribe", theme.MediaStopIcon(), func() {
+		ui.currentEventSourceMu.Lock()
+		nodeID := ui.currentEventSource
+		ui.currentEventSourceMu.Unlock()
+		if nodeID != "" {
+			go func() {
+				ui.controller.UnsubscribeFromEvents(nodeID)
+				ui.currentEventSourceMu.Lock()
+				ui.currentEventSource = ""
+				ui.currentEventSourceMu.Unlock()
+				fyne.Do(func() {
+					ui.eventStatusLabel.SetText(fmt.Sprintf("Unsubscribed [%s]", time.Now().Format("15:04:05")))
+				})
+			}()
+		}
+	})
+
+	ui.eventStatusLabel = widget.NewLabel("Not subscribed")
+	ui.eventStatusLabel.Wrapping = fyne.TextWrapWord
+
+	ui.eventData = make([]*controller.EventItem, 0)
+	ui.eventList = widget.NewList(
+		func() int { return len(ui.eventData) },
+		func() fyne.CanvasObject { return widget.NewLabel("") },
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			item := ui.eventData[i]
+			label := o.(*widget.Label)
+			label.SetText(fmt.Sprintf("[%s] %s (%d) - %s: %s", item.Time.Format("15:04:05"), item.EventType, item.Severity, item.SourceName, item.Message))
+		},
+	)
+	useSelectedBtn := widget.NewButton("Use Selected Node", func() {
+		if ui.selectedNodeID != "" {
+			ui.eventSourceEntry.SetText(string(ui.selectedNodeID))
+		}
+	})
+
+	// Create status row with label
+	statusRow := container.NewVBox(
+		ui.eventStatusLabel,
+	)
+
+	// Create input row with buttons
+	inputRow := container.NewHBox(ui.eventSourceEntry, useSelectedBtn, ui.subscribeEventsBtn, ui.unsubscribeEventsBtn)
+
+	ui.eventCard = widget.NewCard(ui.t("events"), "", container.NewBorder(
+		container.NewVBox(statusRow, inputRow),
+		nil, nil, nil,
+		container.NewScroll(ui.eventList),
+	))
 }
 
 func (ui *UI) initCallbacks() {
@@ -967,15 +1099,98 @@ func (ui *UI) initCallbacks() {
 				return
 			}
 
-			ui.nodeInfoData = map[string]string{
-				"NodeID":      attrs.NodeID,
-				"NodeClass":   attrs.NodeClass,
-				"DisplayName": attrs.Name,
-				"Description": attrs.Description,
-				"DataType":    attrs.DataType,
-				"AccessLevel": attrs.AccessLevel,
-				"Value":       attrs.Value,
+			// Build detailed attribute display (UAExpert-style grouped view)
+			ui.nodeInfoData = make(map[string]string)
+
+			// NodeId breakdown
+			ui.nodeInfoData["NodeID"] = attrs.NodeID
+			if attrs.NamespaceIndex != "" {
+				ui.nodeInfoData["NamespaceIndex"] = attrs.NamespaceIndex
 			}
+			if attrs.IdentifierType != "" {
+				ui.nodeInfoData["IdentifierType"] = attrs.IdentifierType
+			}
+			if attrs.Identifier != "" {
+				ui.nodeInfoData["Identifier"] = attrs.Identifier
+			}
+
+			// NodeClass
+			ui.nodeInfoData["NodeClass"] = attrs.NodeClass
+
+			// Names and Description
+			if attrs.BrowseName != "" {
+				ui.nodeInfoData["BrowseName"] = attrs.BrowseName
+			}
+			ui.nodeInfoData["DisplayName"] = attrs.Name
+			if attrs.Description != "" {
+				ui.nodeInfoData["Description"] = attrs.Description
+			}
+
+			// EventNotifier (for Object nodes)
+			if attrs.EventNotifier != "" {
+				ui.nodeInfoData["EventNotifier"] = fmt.Sprintf("%s (%s)", attrs.EventNotifier, attrs.EventNotifierFlags)
+			}
+
+			// WriteMask / UserWriteMask
+			if attrs.WriteMask != "" {
+				ui.nodeInfoData["WriteMask"] = fmt.Sprintf("%s (%s)", attrs.WriteMask, attrs.WriteMaskFlags)
+			}
+			if attrs.UserWriteMask != "" {
+				ui.nodeInfoData["UserWriteMask"] = fmt.Sprintf("%s (%s)", attrs.UserWriteMask, attrs.UserWriteMaskFlags)
+			}
+
+			// RolePermissions
+			if attrs.RolePermissions != "" {
+				ui.nodeInfoData["RolePermissions"] = attrs.RolePermissions
+			}
+			if attrs.UserRolePermissions != "" {
+				ui.nodeInfoData["UserRolePermissions"] = attrs.UserRolePermissions
+			}
+
+			// AccessRestrictions
+			if attrs.AccessRestrictions != "" {
+				ui.nodeInfoData["AccessRestrictions"] = fmt.Sprintf("%s (%s)", attrs.AccessRestrictions, attrs.AccessRestrictionsFlags)
+			}
+
+			// Variable-specific attributes
+			if strings.Contains(attrs.NodeClass, "Variable") {
+				if attrs.DataType != "" {
+					ui.nodeInfoData["DataType"] = attrs.DataType
+				}
+				ui.nodeInfoData["ValueRank"] = fmt.Sprintf("%d", attrs.ValueRank)
+				if attrs.ArrayDimensions != "" {
+					ui.nodeInfoData["ArrayDimensions"] = attrs.ArrayDimensions
+				}
+				if attrs.AccessLevel != "" {
+					ui.nodeInfoData["AccessLevel"] = attrs.AccessLevel
+				}
+				if attrs.UserAccessLevel != "" {
+					ui.nodeInfoData["UserAccessLevel"] = attrs.UserAccessLevel
+				}
+				if attrs.Historizing != "" {
+					ui.nodeInfoData["Historizing"] = attrs.Historizing
+				}
+				ui.nodeInfoData["Value"] = attrs.Value
+			}
+
+			// Method-specific attributes
+			if strings.Contains(attrs.NodeClass, "Method") {
+				if attrs.Executable != "" {
+					ui.nodeInfoData["Executable"] = attrs.Executable
+				}
+				if attrs.UserExecutable != "" {
+					ui.nodeInfoData["UserExecutable"] = attrs.UserExecutable
+				}
+			}
+
+			// Update the keys list to reflect all populated fields
+			ui.nodeInfoKeys = make([]string, 0, len(ui.nodeInfoData))
+			for k := range ui.nodeInfoData {
+				ui.nodeInfoKeys = append(ui.nodeInfoKeys, k)
+			}
+			// Sort keys for consistent display
+			sort.Strings(ui.nodeInfoKeys)
+
 			ui.nodeInfoTable.Refresh()
 			// 属性内容可能变化，更新列宽（左列适配名称，右列适配值或占满剩余宽度）
 			ui.updateDetailsColumnWidths()
@@ -1003,6 +1218,13 @@ func (ui *UI) initCallbacks() {
 			ui.nodeCacheMutex.Unlock()
 		})
 	}
+
+	c.OnEventReceived = func(event *controller.EventItem) {
+		fyne.Do(func() {
+			ui.eventData = append([]*controller.EventItem{event}, ui.eventData...) // Add new event to the top
+			ui.eventList.Refresh()
+		})
+	}
 }
 
 func (ui *UI) resetNodeDetails() {
@@ -1010,6 +1232,65 @@ func (ui *UI) resetNodeDetails() {
 	ui.nodeInfoTable.Refresh()
 	ui.watchBtn.Disable()
 	ui.writeBtn.Disable()
+	if ui.datasetHistoryBtn != nil {
+		ui.datasetHistoryBtn.Disable()
+	}
+}
+
+// showEventSourcesDialog displays a list of candidate event sources under the given node
+func (ui *UI) showEventSourcesDialog(startNodeID string) {
+	go func() {
+		sources, err := ui.controller.BrowseEventSources(startNodeID)
+		if err != nil {
+			ui.controller.Log(fmt.Sprintf("[red]Failed to browse event sources: %v[-]", err))
+			return
+		}
+
+		if len(sources) == 0 {
+			ui.controller.Log(fmt.Sprintf("[yellow]No event sources found under %s[-]", startNodeID))
+			return
+		}
+
+		fyne.Do(func() {
+			// Create list of sources
+			list := widget.NewList(
+				func() int { return len(sources) },
+				func() fyne.CanvasObject { return widget.NewLabel("") },
+				func(i widget.ListItemID, o fyne.CanvasObject) {
+					src := sources[i]
+					o.(*widget.Label).SetText(fmt.Sprintf("%s\n  NodeID: %s\n  EventNotifier: %s (%s)",
+						src.DisplayName, src.NodeID, src.EventNotifier, src.EventNotifierFlags))
+				},
+			)
+
+			var picker *dialog.CustomDialog
+			list.OnSelected = func(id widget.ListItemID) {
+				if id < 0 || id >= len(sources) {
+					return
+				}
+				sel := sources[id]
+				// Subscribe to the selected source
+				go func() {
+					ui.controller.SubscribeToEvents(sel.NodeID)
+					fyne.Do(func() {
+						ui.eventSourceEntry.SetText(sel.NodeID)
+						ui.eventStatusLabel.SetText(fmt.Sprintf("Subscribed: %s / %s [%s]", sel.DisplayName, sel.NodeID, time.Now().Format("15:04:05")))
+					})
+					ui.currentEventSourceMu.Lock()
+					ui.currentEventSource = sel.NodeID
+					ui.currentEventSourceMu.Unlock()
+				}()
+				if picker != nil {
+					picker.Hide()
+				}
+			}
+
+			content := container.NewVScroll(list)
+			content.SetMinSize(fyne.NewSize(480, 300))
+			picker = dialog.NewCustom("Select Event Source", "Cancel", content, ui.window)
+			picker.Show()
+		})
+	}()
 }
 
 func (ui *UI) onConnectClicked() {
@@ -1113,7 +1394,17 @@ func (ui *UI) showConfigDialog() {
 	sessionTimeoutEntry.SetText(fmt.Sprintf("%d", ui.config.SessionTimeout))
 
 	policySelect := widget.NewSelect(
-		[]string{"Auto", "None", "Basic128Rsa15", "Basic256", "Basic256Sha256"},
+		[]string{
+			"Auto",
+			"None",
+			"Basic128Rsa15",         // Deprecated
+			"Basic256",              // Deprecated
+			"Basic256Sha256",        // Recommended
+			"Aes128_Sha256_RsaOaep", // Modern AES
+			"Aes128_Sha256_RsaPss",  // Modern AES
+			"Aes256_Sha256_RsaOaep", // Modern AES
+			"Aes256_Sha256_RsaPss",  // Modern AES (Highest security)
+		},
 		nil,
 	)
 	policySelect.SetSelected(ui.config.SecurityPolicy)
@@ -1916,7 +2207,49 @@ func (r *treeRow) TappedSecondary(ev *fyne.PointEvent) {
 		addItem.Disabled = true
 	}
 
-	m := fyne.NewMenu("", addItem)
+	// Build menu items for Subscribe to Events
+	subscribeItem := fyne.NewMenuItem("Subscribe to Events", func() {
+		nid := string(r.nodeID)
+		go func() {
+			// Check if node can be subscribed
+			attrs, err := r.ui.controller.ReadNodeAttributes(nid)
+			if err != nil || attrs == nil {
+				r.ui.controller.Log(fmt.Sprintf("[red]Failed to read node attributes for %s[-]", nid))
+				return
+			}
+
+			// Check if it's an Object with SubscribeToEvents capability
+			if attrs.NodeClass == "Object" && strings.Contains(strings.ToLower(attrs.EventNotifierFlags), "subscribetoevents") {
+				// Directly subscribe
+				r.ui.controller.SubscribeToEvents(nid)
+				fyne.Do(func() {
+					r.ui.eventSourceEntry.SetText(nid)
+					r.ui.eventStatusLabel.SetText(fmt.Sprintf("Subscribed: %s / %s [%s]", attrs.Name, nid, time.Now().Format("15:04:05")))
+				})
+				r.ui.currentEventSourceMu.Lock()
+				r.ui.currentEventSource = nid
+				r.ui.currentEventSourceMu.Unlock()
+			} else {
+				// Show candidate event sources dialog
+				r.ui.showEventSourcesDialog(nid)
+			}
+		}()
+	})
+
+	unsubscribeItem := fyne.NewMenuItem("Unsubscribe", func() {
+		nid := string(r.nodeID)
+		go func() {
+			r.ui.controller.UnsubscribeFromEvents(nid)
+			fyne.Do(func() {
+				r.ui.eventStatusLabel.SetText(fmt.Sprintf("Unsubscribed [%s]", time.Now().Format("15:04:05")))
+			})
+			r.ui.currentEventSourceMu.Lock()
+			r.ui.currentEventSource = ""
+			r.ui.currentEventSourceMu.Unlock()
+		}()
+	})
+
+	m := fyne.NewMenu("", addItem, subscribeItem, unsubscribeItem)
 	// Show popup menu (default placement handled by Fyne)
 	widget.NewPopUpMenu(m, r.ui.window.Canvas())
 }
@@ -2123,7 +2456,6 @@ func (ui *UI) makeLayout() fyne.CanvasObject {
 			ui.apiStatusLabel,
 		),
 	)
-	// Use plain container to ensure pure white background on all platforms (avoid Card gray on iOS light theme)
 	ui.connectionCard = nil
 	leftTop := connContent
 
@@ -2133,7 +2465,6 @@ func (ui *UI) makeLayout() fyne.CanvasObject {
 	ui.addressSpaceCard = nil
 	leftBottom := addrContent
 	leftPanel := container.NewVSplit(leftTop, leftBottom)
-	// 延迟设置分割比例以确保渲染器已准备就绪
 	defer func() {
 		leftPanel.SetOffset(0.19)
 	}()
@@ -2156,7 +2487,6 @@ func (ui *UI) makeLayout() fyne.CanvasObject {
 	)
 
 	toolbarBg := NewThemedArea(ui.app, func() color.Color { return theme.Color(theme.ColorNameInputBackground) }, 0, 0)
-	// Pad the toolbar so the ThemedPanel's top border remains visible and not overdrawn
 	toolbar := container.NewPadded(
 		container.NewStack(
 			toolbarBg,
@@ -2173,84 +2503,57 @@ func (ui *UI) makeLayout() fyne.CanvasObject {
 			container.NewPadded(watchScroll), // Add padding around the watch list
 		),
 	)
-	// No Card for watch list; keep pure container for white background
 	ui.watchCard = nil
 
-	// 创建一个自适应宽度的滚动容器，并设置一个合理的最小高度，避免被压扁
+	// Details area
 	scroll := container.NewVScroll(ui.nodeInfoTable)
 	scroll.SetMinSize(fyne.NewSize(0, 240))
-
-	// Details 区域与日志区域结构对齐：背景 + 顶部标题 + 内边距 + 内容
 	detailsBg := newBg()
 	ui.detailsTitleLbl = widget.NewLabelWithStyle(ui.t("selected_details"), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-	detailsHeader := container.NewBorder(
-		nil, nil,
-		ui.detailsTitleLbl,
-		nil,
-		layout.NewSpacer(),
-	)
+	detailsHeader := container.NewBorder(nil, nil, ui.detailsTitleLbl, ui.datasetHistoryBtn, layout.NewSpacer())
 	detailsContainer := container.NewStack(
 		detailsBg,
 		container.NewPadded(
-			container.NewBorder(
-				detailsHeader,
-				nil, nil, nil,
-				scroll,
-			),
+			container.NewBorder(detailsHeader, nil, nil, nil, scroll),
 		),
 	)
-	// No Card for details; keep pure container for white background
 	ui.detailsCard = nil
 
+	// Watch List and Details combined panel
+	watchAndDetailsPanel := container.NewHSplit(watchContent, detailsContainer)
+	watchAndDetailsPanel.SetOffset(0.6)
+
+	// Logs panel
 	ui.clearLogBtn = widget.NewButtonWithIcon(ui.t("clear_logs"), theme.ContentClearIcon(), ui.clearLogs)
 	ui.copyLogBtn = widget.NewButtonWithIcon(ui.t("copy"), theme.ContentCopyIcon(), ui.copyLogs)
 	ui.logTitleLbl = widget.NewLabelWithStyle(ui.t("logs"), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-
-	// 顶部标题栏（右侧：复制 + 清空），添加内边距和按钮间距
-	rightBtns := container.NewHBox(
-		layout.NewSpacer(),
-		ui.copyLogBtn,
-		layout.NewSpacer(),
-		ui.clearLogBtn,
-		layout.NewSpacer(),
-	)
-	header := container.NewBorder(
-		nil, nil,
-		ui.logTitleLbl,
-		rightBtns,
-		layout.NewSpacer(),
-	)
-	// Logs with the same subtle gray tint
+	rightBtns := container.NewHBox(layout.NewSpacer(), ui.copyLogBtn, layout.NewSpacer(), ui.clearLogBtn, layout.NewSpacer())
+	header := container.NewBorder(nil, nil, ui.logTitleLbl, rightBtns, layout.NewSpacer())
 	logBg := newBg()
-	// 日志容器使用相同的布局结构保持对齐
-	// 简化日志容器构建
 	logContainer := container.NewStack(
 		logBg,
 		container.NewPadded(
-			container.NewBorder(
-				header, // 顶部放置标题和按钮
-				nil, nil, nil,
-				ui.logScroll,
-			),
+			container.NewBorder(header, nil, nil, nil, ui.logScroll),
 		),
 	)
 
-	// 取消使用 Card，直接使用容器以获得纯白背景
+	// Events panel (already initialized in initWidgets)
+	eventInputBar := container.NewBorder(nil, nil, nil, ui.subscribeEventsBtn, container.NewPadded(ui.eventSourceEntry))
+	eventContent := container.NewBorder(eventInputBar, nil, nil, nil, ui.eventList)
+	eventsBg := newBg()
+	eventsContainer := container.NewStack(eventsBg, container.NewPadded(eventContent))
 
-	// 右侧上下采用可调分割：上（属性）/ 下（日志）- 使用纯容器，避免 Card 的灰背景
-	rightPanel := container.NewVSplit(detailsContainer, logContainer)
-	rightPanel.SetOffset(0.35)
+	// Main content area with tabs
+	mainTabs := container.NewAppTabs(
+		container.NewTabItem(ui.t("watch_list"), watchAndDetailsPanel),
+		container.NewTabItem(ui.t("events"), eventsContainer),
+		container.NewTabItem(ui.t("logs"), logContainer),
+	)
 
-	// 创建监视列表和右侧面板的水平分割
-	centerRightPanel := container.NewHSplit(watchContent, rightPanel)
-	// 设置默认分割比例，避免初次渲染错位
-	centerRightPanel.SetOffset(0.6)
-
-	mainLayout := container.NewHSplit(leftPanel, centerRightPanel)
-	// 设置主分割比例
+	mainLayout := container.NewHSplit(leftPanel, mainTabs)
 	mainLayout.SetOffset(0.3)
 
-	// 顶部品牌栏（iOS 上无窗口标题，这里展示应用名与作者）- 无单独背景
+	// Top brand bar
 	appNameLabel := widget.NewLabelWithStyle("⛰️ OpcUaBaby 🌊", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	brandLabel := widget.NewLabelWithStyle(" 😃 Big GiantBaby 🍀", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true})
 	brand := container.NewPadded(
@@ -2260,11 +2563,8 @@ func (ui *UI) makeLayout() fyne.CanvasObject {
 			brandLabel,
 		),
 	)
-	// 通过 Padded 容器提供的上下内边距保证足够高度
 
-	// 用 Border 将品牌栏置于顶部
 	wrapped := container.NewBorder(brand, nil, nil, nil, mainLayout)
-	// Outermost background: themed, borderless, follows system theme
 	rootBg := NewThemedBackground(ui.app)
 	return container.NewStack(rootBg, wrapped)
 }

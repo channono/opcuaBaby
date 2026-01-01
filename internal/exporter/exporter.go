@@ -1,13 +1,13 @@
 package exporter
 
 import (
-    "context"
-    "encoding/csv"
-    "encoding/json"
-    "fmt"
-    "opcuababy/internal/opc"
-    "os"
-    "strings"
+	"context"
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
+	"opcuababy/internal/opc"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/gopcua/opcua/ua"
@@ -28,39 +28,42 @@ type ExportNode struct {
 
 // ExportToCSV exports the full address space (starting from rootNodeID) to a CSV file.
 func (e *Exporter) ExportToCSV(ctx context.Context, rootNodeID, filePath string) error {
-    visited := make(map[string]struct{})
-    rootNode, err := e.buildTree(ctx, rootNodeID, visited)
-    if err != nil {
-        return fmt.Errorf("failed to build address space tree: %w", err)
-    }
+	visited := make(map[string]struct{})
+	rootNode, err := e.buildTree(ctx, rootNodeID, visited)
+	if err != nil {
+		return fmt.Errorf("failed to build address space tree: %w", err)
+	}
 
-    f, err := os.Create(filePath)
-    if err != nil {
-        return err
-    }
-    defer f.Close()
+	f, err := os.Create(filePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 
-    w := csv.NewWriter(f)
-    defer w.Flush()
+	w := csv.NewWriter(f)
+	defer w.Flush()
 
-    _ = w.Write([]string{"Level", "Name", "NodeID", "NodeClass", "DataType", "AccessLevel", "Description", "Value"})
+	_ = w.Write([]string{"Level", "Name", "NodeID", "NodeClass", "DataType", "AccessLevel", "Description", "Value"})
 
-    // Iterative stack to avoid deep recursion
-    type frame struct { node *ExportNode; level int }
-    stack := []frame{{node: rootNode, level: 0}}
-    for len(stack) > 0 {
-        fr := stack[len(stack)-1]
-        stack = stack[:len(stack)-1]
-        _ = w.Write([]string{
-            fmt.Sprintf("%d", fr.level), fr.node.Name, fr.node.NodeID, fr.node.NodeClass,
-            fr.node.DataType, fr.node.AccessLevel, fr.node.Description, fr.node.Value,
-        })
-        // push children in reverse to keep natural order
-        for i := len(fr.node.Children) - 1; i >= 0; i-- {
-            stack = append(stack, frame{node: fr.node.Children[i], level: fr.level + 1})
-        }
-    }
-    return nil
+	// Iterative stack to avoid deep recursion
+	type frame struct {
+		node  *ExportNode
+		level int
+	}
+	stack := []frame{{node: rootNode, level: 0}}
+	for len(stack) > 0 {
+		fr := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		_ = w.Write([]string{
+			fmt.Sprintf("%d", fr.level), fr.node.Name, fr.node.NodeID, fr.node.NodeClass,
+			fr.node.DataType, fr.node.AccessLevel, fr.node.Description, fr.node.Value,
+		})
+		// push children in reverse to keep natural order
+		for i := len(fr.node.Children) - 1; i >= 0; i-- {
+			stack = append(stack, frame{node: fr.node.Children[i], level: fr.level + 1})
+		}
+	}
+	return nil
 }
 
 // Exporter handles the logic for exporting the address space.
@@ -75,8 +78,8 @@ func New(client *opc.Client) *Exporter {
 
 // ExportToJSON exports the full address space starting from rootNodeID to a JSON file.
 func (e *Exporter) ExportToJSON(ctx context.Context, rootNodeID, filePath string) error {
-    visited := make(map[string]struct{})
-    rootNode, err := e.buildTree(ctx, rootNodeID, visited)
+	visited := make(map[string]struct{})
+	rootNode, err := e.buildTree(ctx, rootNodeID, visited)
 	if err != nil {
 		return fmt.Errorf("failed to build address space tree: %w", err)
 	}
@@ -91,8 +94,8 @@ func (e *Exporter) ExportToJSON(ctx context.Context, rootNodeID, filePath string
 
 // ExportToExcel exports the full address space starting from rootNodeID to an Excel file.
 func (e *Exporter) ExportToExcel(ctx context.Context, rootNodeID, filePath string) error {
-    visited := make(map[string]struct{})
-    rootNode, err := e.buildTree(ctx, rootNodeID, visited)
+	visited := make(map[string]struct{})
+	rootNode, err := e.buildTree(ctx, rootNodeID, visited)
 	if err != nil {
 		return fmt.Errorf("failed to build address space tree: %w", err)
 	}
@@ -120,78 +123,78 @@ func (e *Exporter) ExportToExcel(ctx context.Context, rootNodeID, filePath strin
 // buildTree recursively browses the address space from the given nodeID and builds a tree.
 // visited ensures we don't loop forever if the server exposes cyclic references.
 func (e *Exporter) buildTree(ctx context.Context, nodeID string, visited map[string]struct{}) (*ExportNode, error) {
-    // Cycle protection
-    if _, ok := visited[nodeID]; ok {
-        // already visited: don't expand; try to keep a human-readable name
-        attrs, _ := e.readAttributes(ctx, nodeID)
-        name := nodeID
-        if attrs != nil && attrs.Name != "" {
-            name = attrs.Name
-        }
-        return &ExportNode{ Name: name, NodeID: nodeID }, nil
-    }
+	// Cycle protection
+	if _, ok := visited[nodeID]; ok {
+		// already visited: don't expand; try to keep a human-readable name
+		attrs, _ := e.readAttributes(ctx, nodeID)
+		name := nodeID
+		if attrs != nil && attrs.Name != "" {
+			name = attrs.Name
+		}
+		return &ExportNode{Name: name, NodeID: nodeID}, nil
+	}
 
-    attrs, err := e.readAttributes(ctx, nodeID)
-    if err != nil {
-        return nil, err
-    }
+	attrs, err := e.readAttributes(ctx, nodeID)
+	if err != nil {
+		return nil, err
+	}
 
-    exportNode := &ExportNode{
-        Name:        attrs.Name,
-        NodeID:      attrs.NodeID,
-        NodeClass:   attrs.NodeClass,
-        DataType:    attrs.DataType,
-        AccessLevel: attrs.AccessLevel,
-        Description: attrs.Description,
-        Value:       attrs.Value,
-        Children:    []*ExportNode{},
-    }
-    // mark visited after we know the real NodeID
-    visited[exportNode.NodeID] = struct{}{}
+	exportNode := &ExportNode{
+		Name:        attrs.Name,
+		NodeID:      attrs.NodeID,
+		NodeClass:   attrs.NodeClass,
+		DataType:    attrs.DataType,
+		AccessLevel: attrs.AccessLevel,
+		Description: attrs.Description,
+		Value:       attrs.Value,
+		Children:    []*ExportNode{},
+	}
+	// mark visited after we know the real NodeID
+	visited[exportNode.NodeID] = struct{}{}
 
-    // Only browse children if the node is not a variable (i.e., it's an object or view)
-    if exportNode.NodeClass != ua.NodeClassVariable.String() {
-        browseCtx, cancel := context.WithTimeout(ctx, 30*time.Second) // Timeout for each browse call
-        defer cancel()
-        refs, err := e.client.Browse(browseCtx, ua.MustParseNodeID(nodeID))
-        if err != nil {
-            // Log the error but continue, as some nodes might not be browsable
-            fmt.Printf("could not browse node %s: %v\n", nodeID, err)
-        } else {
-            for _, ref := range refs {
-                // Check for context cancellation before recursing
-                if ctx.Err() != nil {
-                    return nil, ctx.Err()
-                }
-                // Skip if we've seen this NodeID to avoid cycles
-                cid := ref.NodeID.String()
-                if _, ok := visited[cid]; ok {
-                    continue
-                }
-                childNode, err := e.buildTree(ctx, cid, visited)
-                if err != nil {
-                    fmt.Printf("Skipping child node %s due to error: %v\n", ref.NodeID.String(), err)
-                    continue
-                }
-                exportNode.Children = append(exportNode.Children, childNode)
-            }
-        }
-    }
+	// Only browse children if the node is not a variable (i.e., it's an object or view)
+	if exportNode.NodeClass != ua.NodeClassVariable.String() {
+		browseCtx, cancel := context.WithTimeout(ctx, 30*time.Second) // Timeout for each browse call
+		defer cancel()
+		refs, err := e.client.Browse(browseCtx, ua.MustParseNodeID(nodeID))
+		if err != nil {
+			// Log the error but continue, as some nodes might not be browsable
+			fmt.Printf("could not browse node %s: %v\n", nodeID, err)
+		} else {
+			for _, ref := range refs {
+				// Check for context cancellation before recursing
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				// Skip if we've seen this NodeID to avoid cycles
+				cid := ref.NodeID.String()
+				if _, ok := visited[cid]; ok {
+					continue
+				}
+				childNode, err := e.buildTree(ctx, cid, visited)
+				if err != nil {
+					fmt.Printf("Skipping child node %s due to error: %v\n", ref.NodeID.String(), err)
+					continue
+				}
+				exportNode.Children = append(exportNode.Children, childNode)
+			}
+		}
+	}
 
-    return exportNode, nil
+	return exportNode, nil
 }
 
 // readAttributes reads all relevant attributes for a given node.
 func (e *Exporter) readAttributes(ctx context.Context, nodeID string) (*ExportNode, error) {
-    attrsToRead := []ua.AttributeID{
-        ua.AttributeIDNodeID,
-        ua.AttributeIDNodeClass,
-        ua.AttributeIDDisplayName,
-        ua.AttributeIDDescription,
-        ua.AttributeIDAccessLevel,
-        ua.AttributeIDDataType,
-        ua.AttributeIDValue,
-    }
+	attrsToRead := []ua.AttributeID{
+		ua.AttributeIDNodeID,
+		ua.AttributeIDNodeClass,
+		ua.AttributeIDDisplayName,
+		ua.AttributeIDDescription,
+		ua.AttributeIDAccessLevel,
+		ua.AttributeIDDataType,
+		ua.AttributeIDValue,
+	}
 
 	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
