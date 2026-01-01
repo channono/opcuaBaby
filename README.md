@@ -64,11 +64,17 @@ Open Settings in the app to configure:
 Just one click Generate Certificates button. This generates and selects the local CA certificate and private key for the client security channel.  Ensure your server trusts the generated CA certificate for secure connections.
 
 ## Security & Authentication
-* __Security Policies__: None, Basic256Sha256
+* __Security Policies__: 
+  - **None** - No encryption (testing only)
+  - **Basic128Rsa15**, **Basic256** - Legacy policies (deprecated, for compatibility)
+  - **Basic256Sha256** - Recommended for most applications
+  - **Aes128_Sha256_RsaOaep**, **Aes128_Sha256_RsaPss** - Modern AES-128 encryption
+  - **Aes256_Sha256_RsaOaep**, **Aes256_Sha256_RsaPss** - Modern AES-256 encryption (highest security)
 * __Security Modes__: None, Sign, SignAndEncrypt
 * __Authentication__: Anonymous, Username
 * __Behavior__: When Security Mode is `None`, certificate/key fields are hidden and only Anonymous auth is available.
 * __Certificates__: Use Generate to create/select the local CA cert/key, and trust the generated CA on your server for secure modes.
+* __Details__: See [Security Policies Documentation](./docs/SECURITY_POLICIES.md) for comprehensive information on all supported encryption methods.
 
 ## REST API
 Base path: `/api/v1`
