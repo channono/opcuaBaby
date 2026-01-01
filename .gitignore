@@ -14,13 +14,13 @@ Icon.png
 *.deb
 *.pkg
 
-/release
-/release/*
-/docs
-/docs/*
-/apitest
-/apitest/*
-/tools
-/tools/*
-/fyne-cross
-/fyne-cross/*
+release
+release/*
+docs
+docs/*
+apitest
+apitest/*
+tools
+tools/*
+fyne-cross
+fyne-cross/*
