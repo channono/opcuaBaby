@@ -1,7 +1,7 @@
 # Environment and secrets
 .env
 .env.*
-!.env.example
+
 
 # Binaries and packages
 *.dmg
@@ -14,6 +14,11 @@ Icon.png
 *.txt
 *.deb
 *.pkg
+
+# Compiled binaries
+opcuababy-*
+opcuababy
+!opcuababy.desktop
 
 release
 release/*
