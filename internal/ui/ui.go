@@ -246,6 +246,11 @@ var i18n = map[string]map[string]string{
 		"auto_generate_cert":      "Auto-generate certificates",
 		"generate_cert":           "Generate Certificates",
 		"cert_info":               "Certificate Info",
+		"ui_scale":                "UI Scale (Requires Restart)",
+		"ui_scale_placeholder":    "e.g. 1.0, 1.5, 2.0 (0=Auto)",
+		"tab_connection":          "Connection",
+		"tab_security":            "Security",
+		"tab_general":             "General",
 	},
 	"zh": {
 		"endpoint":            "服务端地址",
@@ -319,6 +324,11 @@ var i18n = map[string]map[string]string{
 		"auto_generate_cert":      "自动生成证书",
 		"generate_cert":           "生成证书",
 		"cert_info":               "证书信息",
+		"ui_scale":                "UI界面缩放 (需重启)",
+		"ui_scale_placeholder":    "如 1.0, 1.5, 2.0 (0=自动)",
+		"tab_connection":          "连接",
+		"tab_security":            "安全",
+		"tab_general":             "常规",
 	},
 }
 
@@ -664,6 +674,9 @@ func NewUI(c *controller.Controller, apiStatus *string) *UI {
 	}
 
 	ui.loadConfig()
+
+	// Scale is applied via FYNE_SCALE env var in main.go before app startup
+	// see main.go:trySetScaleEnv
 
 	// Set initial localized API status text
 	ui.initWidgets()
@@ -1678,6 +1691,14 @@ func (ui *UI) showConfigDialog() {
 	timeoutEntry.SetPlaceHolder(ui.t("placeholder_timeout_s"))
 	timeoutEntry.SetText(fmt.Sprintf("%.1f", ui.config.ConnectTimeout))
 
+	scaleEntry := widget.NewEntry()
+	scaleEntry.SetPlaceHolder(ui.t("ui_scale_placeholder"))
+	if ui.config.Scale > 0 {
+		scaleEntry.SetText(fmt.Sprintf("%g", ui.config.Scale))
+	} else {
+		scaleEntry.SetText("")
+	}
+
 	// Discover Endpoints button and logic
 	discoverBtn := widget.NewButton(ui.t("discover_endpoints"), func() {
 		// Determine timeout from field or fallback
@@ -1838,34 +1859,59 @@ func (ui *UI) showConfigDialog() {
 
 	endpointRow := container.NewBorder(nil, nil, nil, discoverBtn, endpointEntry)
 
-	formItems := []*widget.FormItem{
+	// Group items into tabs
+	// 1. Connection Tab
+	connFormItems := []*widget.FormItem{
 		widget.NewFormItem(ui.t("endpoint_url"), endpointRow),
 		widget.NewFormItem(ui.t("application_uri"), appURIEntry),
 		widget.NewFormItem(ui.t("product_uri"), productURIEntry),
 		widget.NewFormItem(ui.t("session_timeout_s"), sessionTimeoutEntry),
 		widget.NewFormItem(ui.t("connect_timeout_s"), timeoutEntry),
+	}
+	connForm := &widget.Form{Items: connFormItems}
+	// Scrollable container for Connection tab
+	connScroll := container.NewVScroll(container.NewPadded(connForm))
+
+	// 2. Security Tab
+	secFormItems := []*widget.FormItem{
 		widget.NewFormItem(ui.t("security_policy"), policySelect),
 		widget.NewFormItem(ui.t("security_mode"), modeSelect),
-		// Place certificate/key next to security settings
 		widget.NewFormItem("", certRow),
 		widget.NewFormItem("", keyRow),
 		widget.NewFormItem("", certActionsRow),
 		widget.NewFormItem(ui.t("authentication"), authModeRadio),
 		widget.NewFormItem("", credHolder),
+	}
+	secForm := &widget.Form{Items: secFormItems}
+	secScroll := container.NewVScroll(container.NewPadded(secForm))
+
+	// 3. General Tab
+	genFormItems := []*widget.FormItem{
+		widget.NewFormItem(ui.t("language"), languageSelect),
+		widget.NewFormItem(ui.t("ui_scale"), scaleEntry),
+		widget.NewFormItem("", autoConnectCheck),
+		widget.NewFormItem("", disableLogCheck),
 		widget.NewFormItem(ui.t("api_port"), apiPortEntry),
 		widget.NewFormItem("", apiEnabledCheck),
-		widget.NewFormItem("", disableLogCheck),
-		widget.NewFormItem("", autoConnectCheck),
-		widget.NewFormItem(ui.t("language"), languageSelect),
+	}
+	genForm := &widget.Form{Items: genFormItems}
+	genScroll := container.NewVScroll(container.NewPadded(genForm))
+
+	// Create Tabs
+	tabs := container.NewAppTabs(
+		container.NewTabItem(ui.t("tab_connection"), connScroll),
+		container.NewTabItem(ui.t("tab_security"), secScroll),
+		container.NewTabItem(ui.t("tab_general"), genScroll),
+	)
+
+	// Ensure the Forms do not render their own buttons
+	for _, f := range []*widget.Form{connForm, secForm, genForm} {
+		f.OnSubmit = nil
+		f.OnCancel = nil
+		f.SubmitText = ""
+		f.CancelText = ""
 	}
 
-	// Build custom form content so we can style buttons
-	formWidget := &widget.Form{Items: formItems}
-	// Ensure the Form does not render its own Cancel/Submit buttons
-	formWidget.OnSubmit = nil
-	formWidget.OnCancel = nil
-	formWidget.SubmitText = ""
-	formWidget.CancelText = ""
 	// Footer with buttons
 	var settingsDlg *dialog.CustomDialog
 	cancelBtn := widget.NewButtonWithIcon(ui.t("cancel_btn"), theme.CancelIcon(), func() {
@@ -1873,9 +1919,9 @@ func (ui *UI) showConfigDialog() {
 			settingsDlg.Hide()
 		}
 	})
-	cancelBtn.Importance = widget.MediumImportance // default style
+	cancelBtn.Importance = widget.MediumImportance
 	saveBtn := widget.NewButtonWithIcon(ui.t("save_btn"), theme.ConfirmIcon(), func() {
-		// Save logic
+		// Save logic - same as before
 		ui.config.EndpointURL = endpointEntry.Text
 		ui.endpointEntry.SetText(endpointEntry.Text)
 		ui.config.ApplicationURI = appURIEntry.Text
@@ -1898,6 +1944,11 @@ func (ui *UI) showConfigDialog() {
 		if timeout, err := strconv.ParseFloat(timeoutEntry.Text, 64); err == nil {
 			ui.config.ConnectTimeout = timeout
 		}
+		if s, err := strconv.ParseFloat(scaleEntry.Text, 32); err == nil {
+			ui.config.Scale = float32(s)
+		} else {
+			ui.config.Scale = 0
+		}
 		// Persist and apply changes
 		ui.saveConfig()
 		ui.applyLanguage()
@@ -1909,11 +1960,14 @@ func (ui *UI) showConfigDialog() {
 
 	// Build dialog content with footer and subtle border
 	footer := container.NewHBox(layout.NewSpacer(), cancelBtn, saveBtn)
-	formContent := container.NewBorder(nil, footer, nil, nil, formWidget)
+	// Use tabs as main content
+	contentWithFooter := container.NewBorder(nil, footer, nil, nil, tabs)
 	bg := NewThemedArea(ui.app, func() color.Color { return theme.Color(theme.ColorNameBackground) }, 1, appleCornerRadius)
-	bordered := container.NewMax(bg, container.NewPadded(formContent))
+	bordered := container.NewMax(bg, container.NewPadded(contentWithFooter))
 
 	settingsDlg = dialog.NewCustomWithoutButtons(ui.t("connection_settings"), bordered, ui.window)
+	// Set explicit size for dialog to ensure tabs render comfortably
+	settingsDlg.Resize(fyne.NewSize(500, 600))
 	settingsDlg.Show()
 
 }

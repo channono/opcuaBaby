@@ -48,6 +48,8 @@ type Config struct {
 	AutoGenerateCert  bool    `json:"auto_generate_cert,omitempty"` // Automatically generate certificates if missing
 	// PollIntervalMs controls how often the watchlist poller will read non-subscribed nodes (milliseconds)
 	PollIntervalMs    int     `json:"poll_interval_ms,omitempty"`
+	// Scale allows overriding the default UI scaling (e.g. 1.0, 1.5, 2.0). 0 means Auto.
+	Scale float32 `json:"scale,omitempty"`
 }
 
 // ToOpcuaOptions converts the Config struct into a slice of opcua.Option
