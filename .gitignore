@@ -9,6 +9,7 @@
 *.exe
 .DS_Store
 *.md
+!README.md
 Icon.png
 *.txt
 *.deb
