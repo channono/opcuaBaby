@@ -1,4 +1,26 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Binaries and packages
 *.dmg
 *.apk
 *.exe
 .DS_Store
+*.md
+Icon.png
+*.txt
+*.deb
+*.pkg
+
+/release
+/release/*
+/docs
+/docs/*
+/apitest
+/apitest/*
+/tools
+/tools/*
+/fyne-cross
+/fyne-cross/*
