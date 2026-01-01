@@ -1,7 +1,7 @@
 # Environment and secrets
 .env
 .env.*
-
+.gemini-clipboard
 
 # Binaries and packages
 *.dmg
@@ -18,7 +18,7 @@ Icon.png
 # Compiled binaries
 opcuababy-*
 opcuababy
-!opcuababy.desktop
+
 
 release
 release/*
