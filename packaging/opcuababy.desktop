@@ -1,0 +1,24 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=opcuaBaby
+GenericName=OPC UA Client
+Comment=OPC UA Client with Modern Encryption Support
+Exec=opcuababy %U
+Icon=opcuababy
+Terminal=false
+StartupNotify=true
+# Correct categories - compliant with freedesktop.org spec
+Categories=Network;Development;Monitor;
+# Keywords for search
+Keywords=OPC;UA;OPCUA;Industrial;Automation;SCADA;PLC;IIoT;Client;Protocol;
+# MIME types (if needed)
+MimeType=
+# Working directory on startup
+Path=
+# Show only in specific desktop environments (empty = all)
+OnlyShowIn=
+# Do not show in specific desktop environments
+NotShowIn=
+# Notifications support
+X-GNOME-UsesNotifications=true
